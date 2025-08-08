@@ -1,0 +1,4 @@
+session_time,topic,relevance_score,clarity_score,technical_depth_score,summary
+20250801_131941,Machine Learning,6,8,7.5,"The candidate provided clear explanations of the PEFT approach and its advantages but lacked depth in other areas, such as exploring alternative fine-tuning methods or discussing potential challenges with LLMs."
+20250801_174014,Deep Learning,6,8,7.5,The candidate showed a good grasp of the topic but could have provided more in-depth technical details and better clarity in their explanations.
+20250801_174752,Deep Learning,6,8,7.5,"While the candidate's answer was generally relevant to the topic, their explanation could have been more concise and they demonstrated a good understanding of PyTorch concepts."

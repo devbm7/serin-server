@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jarvis AI Conversation Sphere</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            overflow: hidden;
+            font-family: 'Arial', sans-serif;
+        }
+        
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            color: #00ffff;
+        }
+        
+        .state-button {
+            background: rgba(0, 255, 255, 0.2);
+            border: 1px solid #00ffff;
+            color: #00ffff;
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+            border-radius: 5px;
+            transition: all 0.3s ease;
+        }
+        
+        .state-button:hover {
+            background: rgba(0, 255, 255, 0.4);
+        }
+        
+        .state-button.active {
+            background: rgba(0, 255, 255, 0.6);
+        }
+        
+        #status {
+            margin-top: 20px;
+            font-size: 18px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <button class="state-button active" onclick="setState('idle')">Idle</button>
+        <button class="state-button" onclick="setState('listening')">Listening</button>
+        <button class="state-button" onclick="setState('processing')">Processing</button>
+        <button class="state-button" onclick="setState('speaking')">Speaking</button>
+        <div id="status">Status: IDLE</div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // Scene setup
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // Sphere geometry
+        const sphereGeometry = new THREE.SphereGeometry(2, 64, 64);
+        
+        // Materials for different states
+        const materials = {
+            idle: new THREE.MeshBasicMaterial({
+                color: 0x001122,
+                wireframe: true,
+                transparent: true,
+                opacity: 0.6
+            }),
+            listening: new THREE.ShaderMaterial({
+                uniforms: {
+                    time: { value: 0 },
+                    color: { value: new THREE.Color(0x00ff88) }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    varying vec3 vPosition;
+                    void main() {
+                        vUv = uv;
+                        vPosition = position;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform float time;
+                    uniform vec3 color;
+                    varying vec2 vUv;
+                    varying vec3 vPosition;
+                    
+                    void main() {
+                        float pulse = sin(time * 3.0) * 0.5 + 0.5;
+                        float noise = sin(vPosition.x * 10.0 + time * 2.0) * 0.1;
+                        float alpha = pulse * 0.8 + noise;
+                        gl_FragColor = vec4(color, alpha);
+                    }
+                `,
+                transparent: true,
+                wireframe: true
+            }),
+            processing: new THREE.ShaderMaterial({
+                uniforms: {
+                    time: { value: 0 },
+                    color: { value: new THREE.Color(0xffaa00) }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    varying vec3 vPosition;
+                    uniform float time;
+                    void main() {
+                        vUv = uv;
+                        vPosition = position;
+                        vec3 pos = position;
+                        pos += normal * sin(pos.x * 5.0 + time * 3.0) * 0.1;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform float time;
+                    uniform vec3 color;
+                    varying vec2 vUv;
+                    varying vec3 vPosition;
+                    
+                    void main() {
+                        float pattern = sin(vPosition.x * 8.0 + time * 4.0) * sin(vPosition.y * 8.0 + time * 3.0) * sin(vPosition.z * 8.0 + time * 5.0);
+                        float alpha = abs(pattern) * 0.8 + 0.2;
+                        gl_FragColor = vec4(color, alpha);
+                    }
+                `,
+                transparent: true
+            }),
+            speaking: new THREE.ShaderMaterial({
+                uniforms: {
+                    time: { value: 0 },
+                    color: { value: new THREE.Color(0x0088ff) }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    varying vec3 vPosition;
+                    void main() {
+                        vUv = uv;
+                        vPosition = position;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform float time;
+                    uniform vec3 color;
+                    varying vec2 vUv;
+                    varying vec3 vPosition;
+                    
+                    void main() {
+                        float wave = sin(length(vPosition.xy) * 10.0 - time * 8.0) * 0.5 + 0.5;
+                        float pulse = sin(time * 6.0) * 0.3 + 0.7;
+                        float alpha = wave * pulse;
+                        gl_FragColor = vec4(color, alpha);
+                    }
+                `,
+                transparent: true
+            })
+        };
+
+        // Create sphere mesh
+        const sphere = new THREE.Mesh(sphereGeometry, materials.idle);
+        scene.add(sphere);
+
+        // Add wireframe overlay for extra detail
+        const wireframeGeometry = new THREE.SphereGeometry(2.1, 32, 32);
+        const wireframeMaterial = new THREE.MeshBasicMaterial({
+            color: 0x00ffff,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.1
+        });
+        const wireframeSphere = new THREE.Mesh(wireframeGeometry, wireframeMaterial);
+        scene.add(wireframeSphere);
+
+        // Particle system for extra effects
+        const particleCount = 200;
+        const particles = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        const velocities = [];
+
+        for (let i = 0; i < particleCount; i++) {
+            const radius = 3 + Math.random() * 2;
+            const phi = Math.random() * Math.PI * 2;
+            const theta = Math.random() * Math.PI;
+            
+            positions[i * 3] = radius * Math.sin(theta) * Math.cos(phi);
+            positions[i * 3 + 1] = radius * Math.sin(theta) * Math.sin(phi);
+            positions[i * 3 + 2] = radius * Math.cos(theta);
+            
+            velocities.push({
+                phi: Math.random() * 0.02 - 0.01,
+                theta: Math.random() * 0.02 - 0.01
+            });
+        }
+
+        particles.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        
+        const particleMaterial = new THREE.PointsMaterial({
+            color: 0x00ffff,
+            size: 0.05,
+            transparent: true,
+            opacity: 0.6
+        });
+        
+        const particleSystem = new THREE.Points(particles, particleMaterial);
+        scene.add(particleSystem);
+
+        // Camera position
+        camera.position.z = 8;
+
+        // Current state
+        let currentState = 'idle';
+        let time = 0;
+
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 0.016;
+
+            // Update shader uniforms
+            if (materials[currentState].uniforms) {
+                materials[currentState].uniforms.time.value = time;
+            }
+
+            // Rotate sphere based on state
+            switch(currentState) {
+                case 'idle':
+                    sphere.rotation.y += 0.005;
+                    wireframeSphere.rotation.y += 0.002;
+                    break;
+                case 'listening':
+                    sphere.rotation.y += 0.01;
+                    sphere.rotation.x = Math.sin(time * 2) * 0.1;
+                    wireframeSphere.rotation.y += 0.008;
+                    break;
+                case 'processing':
+                    sphere.rotation.y += 0.02;
+                    sphere.rotation.x += 0.015;
+                    sphere.rotation.z += 0.01;
+                    wireframeSphere.rotation.y += 0.015;
+                    wireframeSphere.rotation.x -= 0.01;
+                    break;
+                case 'speaking':
+                    const scale = 1 + Math.sin(time * 8) * 0.1;
+                    sphere.scale.setScalar(scale);
+                    sphere.rotation.y += 0.008;
+                    wireframeSphere.rotation.y += 0.012;
+                    break;
+            }
+
+            // Animate particles
+            const particlePositions = particleSystem.geometry.attributes.position.array;
+            for (let i = 0; i < particleCount; i++) {
+                const velocity = velocities[i];
+                velocity.phi += (Math.random() - 0.5) * 0.001;
+                velocity.theta += (Math.random() - 0.5) * 0.001;
+                
+                const radius = 3 + Math.sin(time + i * 0.1) * 0.5;
+                const phi = time * velocity.phi + i;
+                const theta = time * velocity.theta + i;
+                
+                particlePositions[i * 3] = radius * Math.sin(theta) * Math.cos(phi);
+                particlePositions[i * 3 + 1] = radius * Math.sin(theta) * Math.sin(phi);
+                particlePositions[i * 3 + 2] = radius * Math.cos(theta);
+            }
+            particleSystem.geometry.attributes.position.needsUpdate = true;
+
+            // Update particle opacity based on state
+            particleMaterial.opacity = currentState === 'idle' ? 0.2 : 0.6;
+
+            renderer.render(scene, camera);
+        }
+
+        // State management
+        function setState(state) {
+            currentState = state;
+            sphere.material = materials[state];
+            sphere.scale.setScalar(1); // Reset scale
+            
+            // Update UI
+            document.querySelectorAll('.state-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            
+            document.getElementById('status').textContent = `Status: ${state.toUpperCase()}`;
+            
+            // Update wireframe opacity based on state
+            switch(state) {
+                case 'idle':
+                    wireframeMaterial.opacity = 0.1;
+                    break;
+                case 'listening':
+                    wireframeMaterial.opacity = 0.3;
+                    break;
+                case 'processing':
+                    wireframeMaterial.opacity = 0.5;
+                    break;
+                case 'speaking':
+                    wireframeMaterial.opacity = 0.4;
+                    break;
+            }
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start animation
+        animate();
+    </script>
+</body>
+</html>

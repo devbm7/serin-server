@@ -1,0 +1,35 @@
+# config.yaml
+
+# --- Audio Settings ---
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 512
+  silence_threshold_seconds: 2 # How many seconds of silence indicates the end of speech
+
+# --- Model Configurations ---
+models:
+  # Default ASR (speech-to-text) model to use if the user doesn't select one.
+  # Options can be found in model_selector.py
+  default_asr: "openai/whisper-small"
+
+  # Default LLM (language model) to use.
+  # This should match an entry in model_selector.py
+  default_llm:
+    provider: "ollama"
+    model: "llama3.2:1b"
+
+  # Voice for the TTS (text-to-speech) engine.
+  # Find available voices in the Kokoro TTS documentation.
+  tts_voice: "af_heart"
+
+# --- File Paths ---
+paths:
+  # Path to the resume PDF file.
+  resume_file: "Resume_Meet Bhatt_June25.pdf"
+  # Directory to save session logs.
+  sessions_dir: "sessions"
+  # Log file for debugging.
+  log_file: "pipeline_debug.log"
+
+# --- Interview Settings ---

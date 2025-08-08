@@ -1,0 +1,31 @@
+# Phase 1 Audio Quality Improvements
+# Core dependencies
+numpy>=1.21.0
+torch>=1.9.0
+transformers>=4.20.0
+fastapi>=0.68.0
+uvicorn>=0.15.0
+websockets>=10.0
+pydantic>=1.8.0
+
+# Audio processing
+scipy>=1.7.0  # For audio filtering and preprocessing
+soundfile>=0.10.0
+pyaudio>=0.2.11
+
+# ASR and VAD
+silero-vad>=4.0.0
+
+# LLM
+litellm>=1.0.0
+
+# TTS
+kokoro-tts>=0.1.0
+
+# Utilities
+PyPDF2>=3.0.0
+PyYAML>=6.0
+requests>=2.25.0
+
+# Optional: For better performance
+# sounddevice>=0.4.0  # For audio playback 
