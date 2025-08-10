@@ -23,7 +23,7 @@ def get_gemini_api_key() -> Optional[str]:
     
     if not api_key:
         # Set default key for development
-        default_key = "AIzaSyD-987BdBsdKnCa7oWZktY9_1K27hS-qY8"
+        default_key = "AIzaSyA_lZ78Rf_J9lCBqpu4hFaHSzYopB4CY0Y"
         os.environ['GEMINI_API_KEY'] = default_key
         print("⚠️  Using default Gemini API key. For production, set GEMINI_API_KEY environment variable.")
         return default_key
@@ -41,7 +41,7 @@ def validate_gemini_config() -> bool:
         import litellm
         # Test the API key with a simple request
         response = litellm.completion(
-            model="gemini/gemini-2.5-flash",
+            model="gemini/gemini-2.0-flash",
             messages=[{"role": "user", "content": "Test"}],
             api_key=api_key,
             max_tokens=10
