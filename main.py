@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -19,6 +20,18 @@ from pydantic import BaseModel
 import requests
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import PyPDF2
+
+# Video processing imports
+try:
+    import cv2
+    import supervision as sv
+    from rfdetr import RFDETRNano
+    from rfdetr.util.coco_classes import COCO_CLASSES
+    VIDEO_PROCESSING_AVAILABLE = True
+    logging.info("Video processing libraries loaded successfully")
+except ImportError as e:
+    VIDEO_PROCESSING_AVAILABLE = False
+    logging.warning(f"Video processing libraries not available: {e}")
 
 # Import Supabase configuration
 try:
@@ -94,20 +107,119 @@ app.add_middleware(
 )
 
 def read_resume_content(resume_file: str) -> str:
-    with open(resume_file, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text()
-    return text
+    """Read resume content from either local file or Supabase storage."""
+    try:
+        # First, try to treat it as a local file
+        if os.path.exists(resume_file):
+            with open(resume_file, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text()
+            return text
+        
+        # If not a local file, try to download from Supabase
+        if SUPABASE_AVAILABLE and supabase_config.client:
+            # Check if it looks like a user ID (UUID format)
+            import re
+            uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+            
+            if uuid_pattern.match(resume_file):
+                # It's a user ID, try to get resume from user profile
+                logger.info(f"Treating {resume_file} as user ID, fetching from profile")
+                return load_resume_from_user_profile(resume_file)
+            else:
+                # It might be a direct path to resume in Supabase storage
+                logger.info(f"Treating {resume_file} as direct path to resume in Supabase")
+                return load_resume_from_supabase_path(resume_file)
+        
+        # Fallback: return error message
+        logger.warning(f"Resume file not found locally and Supabase not available: {resume_file}")
+        return "Resume content not available"
+        
+    except Exception as e:
+        logger.error(f"Failed to read resume content from {resume_file}: {e}")
+        return "Resume content not available"
+
+def load_resume_from_user_profile(user_id: str) -> str:
+    """Load resume content from user profile in Supabase."""
+    try:
+        # Get user profile from database
+        response = supabase_config.client.table('user_profiles').select('*').eq('user_id', user_id).execute()
+        
+        if response.data and len(response.data) > 0:
+            user_profile = response.data[0]
+            resume_url = user_profile.get('resume_url')
+            
+            if resume_url:
+                # Download resume from Supabase storage
+                resume_data = supabase_config.download_resume_by_path(resume_url)
+                if resume_data:
+                    # Read PDF content
+                    import io
+                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(resume_data))
+                    text = ""
+                    for page in pdf_reader.pages:
+                        text += page.extract_text()
+                    logger.info(f"Successfully loaded resume content for user {user_id}")
+                    return text
+                else:
+                    logger.warning(f"Resume file not found in Supabase: {resume_url}")
+                    return "Resume file not found in storage"
+            else:
+                logger.warning(f"No resume_url found for user {user_id}")
+                return "No resume found for this user"
+        else:
+            logger.warning(f"User profile not found for user {user_id}")
+            return "User profile not found"
+            
+    except Exception as e:
+        logger.error(f"Failed to load resume from user profile for user {user_id}: {e}")
+        return "Resume content not available (profile error)"
+
+def load_resume_from_supabase_path(resume_path: str) -> str:
+    """Load resume content directly from Supabase storage path."""
+    try:
+        # Extract the actual file path from the URL if it's a full URL
+        import re
+        if resume_path.startswith('http'):
+            # Extract path from URL like: https://.../storage/v1/object/public/resumes/user_id/filename.pdf
+            # We want: user_id/filename.pdf
+            match = re.search(r'/resumes/(.+)$', resume_path)
+            if match:
+                resume_path = match.group(1)
+                logger.info(f"Extracted path from URL: {resume_path}")
+            else:
+                logger.error(f"Could not extract path from URL: {resume_path}")
+                return "Resume content not available (invalid URL format)"
+        
+        # Download resume from Supabase storage
+        resume_data = supabase_config.download_resume_by_path(resume_path)
+        if resume_data:
+            # Read PDF content
+            import io
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(resume_data))
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+            logger.info(f"Successfully loaded resume content from path: {resume_path}")
+            return text
+        else:
+            logger.warning(f"Resume file not found in Supabase: {resume_path}")
+            return "Resume file not found in storage"
+            
+    except Exception as e:
+        logger.error(f"Failed to load resume from Supabase path {resume_path}: {e}")
+        return "Resume content not available (storage error)"
 
 # Pydantic models
 class ModelSelectionRequest(BaseModel):
-    interview_topic: str
-    resume_file: str
+    job_role: str  # From job template
+    user_id: str   # User ID for resume
+    resume_url: str  # Direct path to resume in Supabase storage
     asr_model: str = "openai/whisper-medium"  # Updated default
-    llm_provider: str = "ollama"
-    llm_model: str = "llama3.2:1b"
+    llm_provider: str = "gemini"  # Changed to gemini
+    llm_model: str = "gemini-2.5-flash"  # Changed to gemini-2.5-flash
 
 class AudioChunk(BaseModel):
     type: str
@@ -138,6 +250,347 @@ class RecordingInfo(BaseModel):
     storage_type: str = "supabase"  # "supabase" or "local"
 
 
+class VideoAnnotationProcessor:
+    def __init__(self):
+        if not VIDEO_PROCESSING_AVAILABLE:
+            raise ImportError("Video processing libraries not available.")
+        logger.info("Initializing Video Annotation Processor")
+        try:
+            self.model = RFDETRNano()
+            logger.info("Video annotation model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize video annotation model: {e}")
+            raise
+
+    def annotate_video(self, input_video_path: str, output_video_path: str) -> Dict:
+        """Annotate video with object detection and return detection statistics."""
+        logger.info(f"Starting video annotation: {input_video_path} -> {output_video_path}")
+        
+        try:
+            # Check if input file exists
+            if not os.path.exists(input_video_path):
+                raise FileNotFoundError(f"Input video file not found: {input_video_path}")
+            
+            logger.info(f"Input video exists: {input_video_path}")
+            
+            # Get detailed video properties using ffprobe for accurate timing
+            import subprocess
+            import json
+            
+            # Use ffprobe to get accurate video properties
+            ffprobe_cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                input_video_path
+            ]
+            
+            try:
+                result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    video_info = json.loads(result.stdout)
+                    
+                    # Extract video stream info
+                    video_stream = None
+                    audio_stream = None
+                    for stream in video_info.get('streams', []):
+                        if stream.get('codec_type') == 'video':
+                            video_stream = stream
+                        elif stream.get('codec_type') == 'audio':
+                            audio_stream = stream
+                    
+                    if video_stream:
+                        # Get accurate frame rate from video stream
+                        fps_str = video_stream.get('r_frame_rate', '0/1')
+                        if '/' in fps_str:
+                            num, den = map(int, fps_str.split('/'))
+                            fps = num / den if den > 0 else 30.0
+                        else:
+                            fps = float(fps_str)
+                        
+                        width = int(video_stream.get('width', 0))
+                        height = int(video_stream.get('height', 0))
+                        duration = float(video_info.get('format', {}).get('duration', 0))
+                        
+                        logger.info(f"FFprobe video properties: {width}x{height}, {fps:.3f} FPS, duration: {duration:.2f}s")
+                    else:
+                        raise ValueError("No video stream found in input file")
+                        
+                else:
+                    logger.warning(f"FFprobe failed, falling back to OpenCV: {result.stderr}")
+                    raise RuntimeError("FFprobe failed")
+                    
+            except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
+                logger.warning(f"FFprobe error, falling back to OpenCV: {e}")
+                # Fallback to OpenCV
+                cap = cv2.VideoCapture(input_video_path)
+                if not cap.isOpened():
+                    raise ValueError(f"Could not open input video: {input_video_path}")
+                
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                duration = total_frames / fps if fps > 0 else 0
+                cap.release()
+                
+                logger.info(f"OpenCV video properties: {width}x{height}, {fps:.3f} FPS, {total_frames} frames, duration: {duration:.2f}s")
+            
+            # Open input video for processing
+            cap = cv2.VideoCapture(input_video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Could not open input video: {input_video_path}")
+            
+            # Get total frames for progress tracking
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Create temporary video file for annotated frames (without audio)
+            temp_video_path = output_video_path.replace('.webm', '_temp.mp4')
+            
+            # Use the original frame rate for the temporary video to preserve timing
+            original_fps = fps
+            
+            # Setup video writer for temporary file with original frame rate
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(temp_video_path, fourcc, original_fps, (width, height))
+            
+            if not out.isOpened():
+                raise ValueError(f"Could not create temporary video writer: {temp_video_path}")
+            
+            logger.info(f"Temporary video writer created with {original_fps:.3f} FPS: {temp_video_path}")
+            
+            # Detection statistics
+            detection_stats = {
+                "total_frames": total_frames,
+                "processed_frames": 0,
+                "detection_frames": 0,
+                "person_detections": 0,
+                "device_detections": 0,
+                "capture_data": {},
+                "original_fps": original_fps,
+                "duration": duration
+            }
+            
+            frame_count = 0
+            
+            while True:
+                success, frame = cap.read()
+                if not success:
+                    break
+                
+                frame_count += 1
+                detection_stats["processed_frames"] += 1
+                
+                # Convert BGR to RGB for model input
+                rgb_frame = frame[:, :, ::-1].copy()
+                
+                # Run object detection
+                detections = self.model.predict(rgb_frame, threshold=0.5)
+                
+                # Create labels
+                labels = [
+                    f"{COCO_CLASSES[class_id]} {confidence:.2f}"
+                    for class_id, confidence
+                    in zip(detections.class_id, detections.confidence)
+                ]
+                
+                # Count detections
+                count_of_person = 0
+                count_of_devices = 0
+                
+                for label in labels:
+                    if 'person' in label:
+                        count_of_person += 1
+                    if 'laptop' in label or 'phone' in label or 'remote' in label or 'tv' in label:
+                        count_of_devices += 1
+                
+                # Update statistics
+                if count_of_person > 0 or count_of_devices > 0:
+                    detection_stats["detection_frames"] += 1
+                    detection_stats["person_detections"] += count_of_person
+                    detection_stats["device_detections"] += count_of_devices
+                    
+                    # Record detection data for frames with multiple people or devices
+                    if count_of_person > 1 or count_of_devices > 0:
+                        current_time = datetime.now()
+                        detection_stats["capture_data"][str(current_time)] = labels
+                
+                # Annotate frame
+                annotated_frame = frame.copy()
+                annotated_frame = sv.BoxAnnotator().annotate(annotated_frame, detections)
+                annotated_frame = sv.LabelAnnotator().annotate(annotated_frame, detections, labels)
+                
+                # Write annotated frame
+                out.write(annotated_frame)
+                
+                # Log progress every 100 frames
+                if frame_count % 100 == 0:
+                    logger.info(f"Processed {frame_count}/{total_frames} frames")
+            
+            # Cleanup video capture and writer
+            cap.release()
+            out.release()
+            
+            logger.info(f"Temporary annotated video created: {temp_video_path}")
+            
+            # Verify temporary video properties
+            temp_cap = cv2.VideoCapture(temp_video_path)
+            temp_fps = temp_cap.get(cv2.CAP_PROP_FPS)
+            temp_frames = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            temp_cap.release()
+            logger.info(f"Temporary video properties: {temp_fps:.3f} FPS, {temp_frames} frames, duration: {temp_frames / temp_fps:.2f}s")
+            
+            if abs(temp_frames - total_frames) > 1:
+                logger.warning(f"Frame count mismatch: original={total_frames}, annotated={temp_frames}")
+            if abs(temp_fps - original_fps) > 0.1:
+                logger.warning(f"FPS mismatch: original={original_fps:.3f}, annotated={temp_fps:.3f}")
+            
+            # Use FFmpeg to combine annotated video with original audio and convert to WebM
+            # Key changes for better synchronization:
+            # 1. Use -vsync 1 (cfr) for constant frame rate
+            # 2. Don't force frame rate - preserve original timing
+            # 3. Use -async 1 for audio synchronization
+            # 4. Use -copyts to preserve timestamps
+            try:
+                # First try VP9 encoding (better quality but slower)
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-i', temp_video_path,  # Annotated video (no audio)
+                    '-i', input_video_path,  # Original video (with audio)
+                    '-c:v', 'libvpx-vp9',  # Transcode video to VP9 for WebM compatibility
+                    '-crf', '30',  # Quality setting for VP9 (lower = better quality)
+                    '-b:v', '0',  # Use CRF mode for VP9
+                    '-vsync', '1',  # Use constant frame rate (cfr)
+                    '-async', '1',  # Audio synchronization
+                    '-copyts',  # Preserve timestamps
+                    '-c:a', 'copy',  # Copy audio stream from original video
+                    '-map', '0:v:0',  # Use video from first input (annotated)
+                    '-map', '1:a:0',  # Use audio from second input (original)
+                    '-y',  # Overwrite output file
+                    output_video_path
+                ]
+                
+                logger.info(f"Running FFmpeg command (VP9): {' '.join(ffmpeg_cmd)}")
+                
+                # Run FFmpeg command
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+                
+                if result.returncode == 0:
+                    logger.info(f"FFmpeg successfully created annotated video with audio (VP9): {output_video_path}")
+                    
+                    # Clean up temporary file
+                    if os.path.exists(temp_video_path):
+                        os.remove(temp_video_path)
+                        logger.info(f"Temporary file cleaned up: {temp_video_path}")
+                else:
+                    logger.warning(f"VP9 encoding failed: {result.stderr}")
+                    logger.info("Trying VP8 encoding as fallback...")
+                    
+                    # Fallback to VP8 encoding (faster but lower quality)
+                    ffmpeg_cmd_vp8 = [
+                        'ffmpeg',
+                        '-i', temp_video_path,  # Annotated video (no audio)
+                        '-i', input_video_path,  # Original video (with audio)
+                        '-c:v', 'libvpx',  # Transcode video to VP8 for WebM compatibility
+                        '-crf', '10',  # Quality setting for VP8
+                        '-b:v', '1M',  # Bitrate for VP8
+                        '-vsync', '1',  # Use constant frame rate (cfr)
+                        '-async', '1',  # Audio synchronization
+                        '-copyts',  # Preserve timestamps
+                        '-c:a', 'copy',  # Copy audio stream from original video
+                        '-map', '0:v:0',  # Use video from first input (annotated)
+                        '-map', '1:a:0',  # Use audio from second input (original)
+                        '-y',  # Overwrite output file
+                        output_video_path
+                    ]
+                    
+                    logger.info(f"Running FFmpeg command (VP8): {' '.join(ffmpeg_cmd_vp8)}")
+                    
+                    # Run FFmpeg command with VP8
+                    result_vp8 = subprocess.run(ffmpeg_cmd_vp8, capture_output=True, text=True, timeout=300)
+                    
+                    if result_vp8.returncode == 0:
+                        logger.info(f"FFmpeg successfully created annotated video with audio (VP8): {output_video_path}")
+                        
+                        # Clean up temporary file
+                        if os.path.exists(temp_video_path):
+                            os.remove(temp_video_path)
+                            logger.info(f"Temporary file cleaned up: {temp_video_path}")
+                    else:
+                        logger.error(f"VP8 encoding also failed: {result_vp8.stderr}")
+                        # Fall back to temporary file if both VP9 and VP8 fail
+                        if os.path.exists(temp_video_path):
+                            import shutil
+                            shutil.move(temp_video_path, output_video_path)
+                            logger.warning(f"Fell back to temporary file (no audio): {output_video_path}")
+                        else:
+                            raise RuntimeError("Both VP9 and VP8 encoding failed and temporary file not found")
+                        
+            except (subprocess.TimeoutExpired, FileNotFoundError, RuntimeError) as e:
+                logger.error(f"FFmpeg error: {e}")
+                # Fall back to temporary file if FFmpeg is not available or fails
+                if os.path.exists(temp_video_path):
+                    import shutil
+                    shutil.move(temp_video_path, output_video_path)
+                    logger.warning(f"Fell back to temporary file (no audio): {output_video_path}")
+                else:
+                    raise RuntimeError("FFmpeg failed and temporary file not found")
+            
+            # Verify final output video properties
+            try:
+                final_cap = cv2.VideoCapture(output_video_path)
+                final_fps = final_cap.get(cv2.CAP_PROP_FPS)
+                final_frames = int(final_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                final_cap.release()
+                
+                logger.info(f"Final video properties: {final_fps:.3f} FPS, {final_frames} frames, duration: {final_frames / final_fps:.2f}s")
+                
+                # Check for timing consistency
+                if abs(final_frames - total_frames) > 1:
+                    logger.warning(f"Final frame count mismatch: original={total_frames}, final={final_frames}")
+                if abs(final_fps - original_fps) > 0.1:
+                    logger.warning(f"Final FPS mismatch: original={original_fps:.3f}, final={final_fps:.3f}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not verify final video properties: {e}")
+            
+            logger.info(f"Video annotation completed: {detection_stats['processed_frames']} frames processed")
+            logger.info(f"Detection summary: {detection_stats['person_detections']} persons, {detection_stats['device_detections']} devices")
+            
+            return detection_stats
+            
+        except Exception as e:
+            logger.error(f"Video annotation error: {e}")
+            raise
+
+    def save_detection_data(self, session_id: str, detection_stats: Dict, output_path: str):
+        """Save detection statistics to JSON file."""
+        try:
+            data = {
+                "session_id": session_id,
+                "capture_data": detection_stats["capture_data"],
+                "statistics": {
+                    "total_frames": detection_stats["total_frames"],
+                    "processed_frames": detection_stats["processed_frames"],
+                    "detection_frames": detection_stats["detection_frames"],
+                    "person_detections": detection_stats["person_detections"],
+                    "device_detections": detection_stats["device_detections"]
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            with open(output_path, "w") as f:
+                json.dump(data, f, indent=2)
+            
+            logger.info(f"Detection data saved to: {output_path}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save detection data: {e}")
+            raise
+
+
 # Global session manager
 class SessionManager:
     def __init__(self):
@@ -151,11 +604,74 @@ class SessionManager:
         self.recordings_dir.mkdir(exist_ok=True)
         logger.info(f"Local recordings directory: {self.recordings_dir.absolute()}")
         
+        # Create sessions directory for detection data
+        self.sessions_dir = Path("sessions")
+        self.sessions_dir.mkdir(exist_ok=True)
+        logger.info(f"Sessions directory: {self.sessions_dir.absolute()}")
+        
+        # Initialize video annotation processor if available
+        self.video_processor = None
+        if VIDEO_PROCESSING_AVAILABLE:
+            try:
+                self.video_processor = VideoAnnotationProcessor()
+                logger.info("Video annotation processor initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize video annotation processor: {e}")
+        else:
+            logger.warning("Video processing libraries not available, video annotation will be skipped")
+        
         # Log Supabase availability
         if SUPABASE_AVAILABLE and supabase_config.client:
             logger.info("Supabase storage is available for recordings")
         else:
             logger.warning("Supabase storage is not available, using local storage only")
+        
+        # Session timeout settings (30 minutes)
+        self.session_timeout_seconds = 30 * 60  # 30 minutes
+        self.last_activity: Dict[str, datetime] = {}
+        
+        # Start session cleanup thread
+        self.cleanup_thread = threading.Thread(target=self._session_cleanup_worker, daemon=True)
+        self.cleanup_thread.start()
+        logger.info("Session cleanup thread started")
+    
+    def _session_cleanup_worker(self):
+        """Background thread to clean up inactive sessions."""
+        while True:
+            try:
+                current_time = datetime.now()
+                sessions_to_cleanup = []
+                
+                for session_id, last_activity in self.last_activity.items():
+                    time_diff = (current_time - last_activity).total_seconds()
+                    if time_diff > self.session_timeout_seconds:
+                        sessions_to_cleanup.append(session_id)
+                
+                for session_id in sessions_to_cleanup:
+                    logger.info(f"Session {session_id} timed out, auto-saving and cleaning up")
+                    try:
+                        if session_id in self.sessions:
+                            session_data = self.sessions[session_id]
+                            self.save_session_to_database(session_id, session_data)
+                            logger.info(f"Session {session_id} auto-saved due to timeout")
+                        
+                        # Clean up session
+                        self.delete_session(session_id)
+                        logger.info(f"Session {session_id} cleaned up due to timeout")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to cleanup timed out session {session_id}: {e}")
+                
+                # Sleep for 5 minutes before next cleanup check
+                time.sleep(300)
+                
+            except Exception as e:
+                logger.error(f"Error in session cleanup worker: {e}")
+                time.sleep(60)  # Wait 1 minute before retrying
+    
+    def update_session_activity(self, session_id: str):
+        """Update the last activity time for a session."""
+        self.last_activity[session_id] = datetime.now()
     
     def create_session(self, session_id: str, model_request: ModelSelectionRequest) -> Dict:
         """Create a new interview session with all necessary components."""
@@ -191,14 +707,14 @@ class SessionManager:
             logger.info(f"Initializing TTS processor for session {session_id}")
             session_data["tts_processor"] = TTSProcessor()
             
-            # Load resume content
+            # Load resume content using the resume_url
             logger.info(f"Loading resume content for session {session_id}")
-            session_data["resume_content"] = read_resume_content(model_request.resume_file)
+            session_data["resume_content"] = load_resume_from_supabase_path(model_request.resume_url)
             
             # Create initial conversation prompt
             logger.info(f"Creating initial prompt for session {session_id}")
             initial_prompt = self.create_initial_prompt(
-                model_request.interview_topic,
+                model_request.job_role,
                 session_data["resume_content"]
             )
             session_data["conversation_history"] = [{"role": "system", "content": initial_prompt}, {"role": "user", "content": "Hello"}]
@@ -215,7 +731,7 @@ class SessionManager:
                     session_data["llm_client"],
                     session_data["conversation_history"],
                     model_info,
-                    model_request.interview_topic,
+                    model_request.job_role,
                     session_data["resume_content"]
                 )
                 if opening_question:
@@ -244,6 +760,8 @@ class SessionManager:
                 logger.error(f"Failed to generate opening question: {e}")
             
             self.sessions[session_id] = session_data
+            # Initialize activity tracking
+            self.update_session_activity(session_id)
             logger.info(f"Session {session_id} created successfully")
             return session_data
             
@@ -252,6 +770,8 @@ class SessionManager:
             # Clean up any partially created session
             if session_id in self.sessions:
                 del self.sessions[session_id]
+            if session_id in self.last_activity:
+                del self.last_activity[session_id]
             raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
     
     def get_session(self, session_id: str) -> Dict:
@@ -265,6 +785,12 @@ class SessionManager:
         if session_id in self.sessions:
             session = self.sessions[session_id]
             
+            # Save session information to database before cleanup
+            try:
+                self.save_session_to_database(session_id, session)
+            except Exception as e:
+                logger.error(f"Failed to save session data for {session_id}: {e}")
+            
             # Stop processing thread if running
             if session.get("processing_thread") and session["processing_thread"].is_alive():
                 session["processing_thread"].join(timeout=1)
@@ -277,7 +803,136 @@ class SessionManager:
                     break
             
             del self.sessions[session_id]
+            # Clean up activity tracking
+            if session_id in self.last_activity:
+                del self.last_activity[session_id]
             logger.info(f"Session {session_id} deleted")
+
+    def save_session_to_database(self, session_id: str, session_data: dict):
+        """Save session information to the interview_sessions table."""
+        if not SUPABASE_AVAILABLE or not supabase_config.client:
+            logger.warning("Supabase not available, skipping session save")
+            return
+        
+        try:
+            # Extract conversation history (excluding system prompt and initial "Hello")
+            conversation_history = []
+            for message in session_data.get("conversation_history", []):
+                if message.get("role") == "system":
+                    continue  # Skip system prompt
+                if message.get("role") == "user" and message.get("content") == "Hello":
+                    continue  # Skip initial "Hello"
+                conversation_history.append(message)
+            
+            # Get recording URL if available
+            recording_url = None
+            recording_info = self.get_recording_info(session_id)
+            if recording_info and recording_info.public_url:
+                recording_url = recording_info.public_url
+                logger.info(f"Found recording URL for session {session_id}: {recording_url}")
+            else:
+                logger.warning(f"No recording URL found for session {session_id}")
+            
+            # Get detection data for anomalies
+            detection_data = self.get_detection_data(session_id)
+            anomalies_detected = []
+            if detection_data and detection_data.get("capture_data"):
+                # Analyze detection data for anomalies
+                capture_data = detection_data["capture_data"]
+                logger.info(f"Analyzing detection data for session {session_id}: {len(capture_data)} frames with detections")
+                
+                for timestamp, detections in capture_data.items():
+                    # Count persons and devices more accurately
+                    person_count = 0
+                    device_count = 0
+                    
+                    for detection in detections:
+                        detection_lower = detection.lower()
+                        if "person" in detection_lower:
+                            person_count += 1
+                        elif any(device in detection_lower for device in ["laptop", "phone", "cell phone", "tv", "remote", "computer", "monitor", "keyboard", "mouse"]):
+                            device_count += 1
+                    
+                    logger.debug(f"Frame {timestamp}: {person_count} persons, {device_count} devices - {detections}")
+                    
+                    # Flag anomalies: multiple people or devices detected
+                    if person_count > 1:
+                        logger.info(f"Anomaly detected: Multiple persons ({person_count}) at {timestamp}")
+                        anomalies_detected.append({
+                            "timestamp": timestamp,
+                            "type": "multiple_persons",
+                            "count": person_count,
+                            "detections": detections,
+                            "description": f"Multiple persons detected in frame: {person_count} people"
+                        })
+                    if device_count > 0:
+                        logger.info(f"Anomaly detected: Devices ({device_count}) at {timestamp}")
+                        anomalies_detected.append({
+                            "timestamp": timestamp,
+                            "type": "devices_detected",
+                            "count": device_count,
+                            "detections": detections,
+                            "description": f"Digital devices detected in frame: {device_count} devices"
+                        })
+                
+                logger.info(f"Total anomalies detected for session {session_id}: {len(anomalies_detected)}")
+                
+                # Log summary of anomalies
+                if anomalies_detected:
+                    multiple_persons_count = sum(1 for anomaly in anomalies_detected if anomaly["type"] == "multiple_persons")
+                    devices_count = sum(1 for anomaly in anomalies_detected if anomaly["type"] == "devices_detected")
+                    logger.info(f"Anomaly summary: {multiple_persons_count} frames with multiple persons, {devices_count} frames with devices")
+            else:
+                logger.info(f"No detection data found for session {session_id}")
+            
+            # Prepare session information JSON (without resume_url and recording_url)
+            session_information = {
+                "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
+                "conversation_history": conversation_history,
+                "anomalies_detected": anomalies_detected,
+                "asr_model": session_data.get("model_request").asr_model if session_data.get("model_request") else None,
+                "llm_provider": session_data.get("model_request").llm_provider if session_data.get("model_request") else None,
+                "llm_model": session_data.get("model_request").llm_model if session_data.get("model_request") else None
+            }
+            
+            # Convert datetime to ISO format string for JSON serialization
+            start_time = session_data.get("created_at")
+            if start_time and hasattr(start_time, 'isoformat'):
+                start_time = start_time.isoformat()
+            
+            # Prepare data for interview_sessions table
+            # Note: session_id is the primary key, so we don't include it in the data
+            # The database will generate a new UUID for the primary key
+            session_record = {
+                "interviewee_id": session_data.get("model_request").user_id if session_data.get("model_request") else None,  # User ID from session creation
+                "template_id": None,  # Could be extracted from job_role if needed
+                "start_time": start_time,  # Use created_at as start_time (converted to ISO string)
+                "status": "completed",
+                "session_information": session_information,
+                "resume_url": session_data.get("model_request").resume_url if session_data.get("model_request") else None,  # Separate column
+                "recording_url": recording_url  # Separate column
+            }
+            
+            # Save to database
+            saved_session_id = supabase_config.save_interview_session(session_record)
+            if saved_session_id:
+                # Store the mapping between original session ID and database session ID
+                if not hasattr(self, 'session_id_mapping'):
+                    self.session_id_mapping = {}
+                self.session_id_mapping[session_id] = saved_session_id
+                
+                logger.info(f"Session {session_id} information saved to database with ID: {saved_session_id}")
+                logger.info(f"  - Start time: {session_record['start_time']}")
+                logger.info(f"  - Resume URL: {session_record['resume_url']}")
+                logger.info(f"  - Recording URL: {session_record['recording_url']}")
+                logger.info(f"  - Conversation messages: {len(conversation_history)}")
+                logger.info(f"  - Anomalies detected: {len(anomalies_detected)}")
+            else:
+                logger.error(f"Failed to save session {session_id} information to database")
+                
+        except Exception as e:
+            logger.error(f"Error saving session {session_id} to database: {e}")
+            raise
     
     def load_resume_content(self, resume_file: str) -> str:
         """Load resume content from file."""
@@ -332,12 +987,69 @@ Based on the resume, ask one insightful question related to the topic to start t
         return min(confidence, 1.0)
 
     def save_recording(self, session_id: str, recording_data: bytes, filename: str) -> RecordingInfo:
-        """Save recording to Supabase storage or local storage as fallback."""
+        """Save recording to Supabase storage or local storage as fallback, with video annotation for detection only."""
         try:
-            # Try to upload to Supabase first
+            # First, save the raw recording locally for processing
+            session_dir = self.recordings_dir / session_id
+            session_dir.mkdir(exist_ok=True)
+            
+            # Save the raw recording file locally
+            raw_file_path = session_dir / filename
+            with open(raw_file_path, 'wb') as f:
+                f.write(recording_data)
+            
+            raw_file_size = len(recording_data)
+            logger.info(f"Raw recording saved locally for session {session_id}: {raw_file_path} ({raw_file_size} bytes)")
+            
+            # Check if this is a video file and video processing is available
+            video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv']
+            is_video = any(filename.lower().endswith(ext) for ext in video_extensions)
+            
+            # Always use raw footage for upload, but process for detection if it's a video
+            final_filename = filename
+            final_data = recording_data
+            final_size = raw_file_size
+            
+            if is_video and self.video_processor:
+                try:
+                    logger.info(f"Processing video for anomaly detection (session {session_id})")
+                    
+                    # Create temporary annotated video filename for detection processing only
+                    name_without_ext = Path(filename).stem
+                    temp_annotated_filename = f"{name_without_ext}_temp_annotated.webm"
+                    temp_annotated_file_path = session_dir / temp_annotated_filename
+                    
+                    logger.info(f"Raw video path: {raw_file_path}")
+                    logger.info(f"Temporary annotated video path: {temp_annotated_file_path}")
+                    
+                    # Annotate the video for detection purposes only
+                    detection_stats = self.video_processor.annotate_video(
+                        str(raw_file_path), 
+                        str(temp_annotated_file_path)
+                    )
+                    
+                    # Save detection data
+                    detection_data_path = self.sessions_dir / f"capture_data_{session_id}.json"
+                    self.video_processor.save_detection_data(session_id, detection_stats, str(detection_data_path))
+                    
+                    logger.info(f"Video detection processing completed for session {session_id}")
+                    logger.info(f"Detection stats: {detection_stats['person_detections']} persons, {detection_stats['device_detections']} devices")
+                    
+                    # Clean up temporary annotated file (we don't need to keep it)
+                    if temp_annotated_file_path.exists():
+                        temp_annotated_file_path.unlink()
+                        logger.info(f"Temporary annotated video cleaned up: {temp_annotated_file_path}")
+                    
+                except Exception as video_error:
+                    logger.error(f"Video detection processing failed for session {session_id}: {video_error}")
+                    import traceback
+                    logger.error(f"Video detection error details: {traceback.format_exc()}")
+                    # Continue with raw footage upload even if detection fails
+            
+            # Try to upload raw footage to Supabase
             if SUPABASE_AVAILABLE and supabase_config.client:
                 try:
-                    upload_result = supabase_config.upload_recording(session_id, recording_data, filename)
+                    upload_result = supabase_config.upload_recording(session_id, final_data, final_filename)
                     
                     # Create recording info with Supabase data
                     recording_info = RecordingInfo(
@@ -353,29 +1065,22 @@ Based on the resume, ask one insightful question related to the topic to start t
                     # Store recording info
                     self.recordings[session_id] = recording_info
                     
-                    logger.info(f"Recording uploaded to Supabase for session {session_id}: {upload_result['file_path']} ({upload_result['file_size']} bytes)")
+                    logger.info(f"Raw recording uploaded to Supabase for session {session_id}: {upload_result['file_path']} ({upload_result['file_size']} bytes)")
                     return recording_info
                     
                 except Exception as supabase_error:
                     logger.warning(f"Supabase upload failed, falling back to local storage: {supabase_error}")
             
             # Fallback to local storage
-            session_dir = self.recordings_dir / session_id
-            session_dir.mkdir(exist_ok=True)
-            
-            # Save the recording file locally
-            file_path = session_dir / filename
-            with open(file_path, 'wb') as f:
-                f.write(recording_data)
-            
-            # Get file size
-            file_size = len(recording_data)
+            final_file_path = session_dir / final_filename
+            with open(final_file_path, 'wb') as f:
+                f.write(final_data)
             
             # Create recording info for local storage
             recording_info = RecordingInfo(
                 session_id=session_id,
-                file_path=str(file_path),
-                file_size=file_size,
+                file_path=str(final_file_path),
+                file_size=final_size,
                 upload_time=datetime.now(),
                 storage_type="local"
             )
@@ -383,7 +1088,7 @@ Based on the resume, ask one insightful question related to the topic to start t
             # Store recording info
             self.recordings[session_id] = recording_info
             
-            logger.info(f"Recording saved locally for session {session_id}: {file_path} ({file_size} bytes)")
+            logger.info(f"Raw recording saved locally for session {session_id}: {final_file_path} ({final_size} bytes)")
             return recording_info
             
         except Exception as e:
@@ -393,6 +1098,18 @@ Based on the resume, ask one insightful question related to the topic to start t
     def get_recording_info(self, session_id: str) -> Optional[RecordingInfo]:
         """Get recording info for a session."""
         return self.recordings.get(session_id)
+    
+    def get_detection_data(self, session_id: str) -> Optional[Dict]:
+        """Get detection data for a session."""
+        try:
+            detection_data_path = self.sessions_dir / f"capture_data_{session_id}.json"
+            if detection_data_path.exists():
+                with open(detection_data_path, 'r') as f:
+                    return json.load(f)
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get detection data for session {session_id}: {e}")
+            return None
 
 
 # Global session manager instance
@@ -733,7 +1450,7 @@ def process_utterance(session_id: str, audio_data: np.ndarray) -> InterviewRespo
             session["llm_client"], 
             session["conversation_history"], 
             model_info,
-            session["model_request"].interview_topic,
+            session["model_request"].job_role,
             session["resume_content"]
         )
         
@@ -863,18 +1580,76 @@ async def upload_recording(
         # Read recording data
         recording_data = await recording.read()
         
-        # Generate filename
+        # Generate filename based on content type
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{recording_type}_recording_{session_id}_{timestamp}.webm"
+        content_type = recording.content_type or "video/webm"
+        
+        # Determine file extension based on content type
+        if "video/mp4" in content_type:
+            extension = ".mp4"
+        elif "video/webm" in content_type:
+            extension = ".webm"
+        elif "video/avi" in content_type:
+            extension = ".avi"
+        elif "video/mov" in content_type:
+            extension = ".mov"
+        else:
+            extension = ".webm"  # Default fallback
+        
+        filename = f"{recording_type}_recording_{session_id}_{timestamp}{extension}"
         
         # Save recording (will try Supabase first, fallback to local)
         recording_info = session_manager.save_recording(session_id, recording_data, filename)
         
+        # Try to update existing session in database with recording URL
+        if recording_info.public_url:
+            try:
+                # Check if session exists in database and update with recording URL
+                if SUPABASE_AVAILABLE and supabase_config.client:
+                    # Get the database session ID from the mapping
+                    db_session_id = None
+                    if hasattr(session_manager, 'session_id_mapping') and session_id in session_manager.session_id_mapping:
+                        db_session_id = session_manager.session_id_mapping[session_id]
+                        logger.info(f"Found database session ID mapping: {session_id} -> {db_session_id}")
+                        update_success = supabase_config.update_session_recording_url(db_session_id, recording_info.public_url)
+                    else:
+                        # Try to find the session by looking for recent sessions without recording URLs
+                        logger.info(f"No session ID mapping found for {session_id}, trying to find session in database")
+                        update_success = supabase_config.update_session_recording_url_by_original_id(session_id, recording_info.public_url)
+                    
+                    if update_success:
+                        logger.info(f"Updated existing session with recording URL")
+                    else:
+                        logger.info(f"No existing session found to update with recording URL for {session_id}")
+            except Exception as e:
+                logger.warning(f"Failed to update session with recording URL: {e}")
+        
+        # Check if anomaly detection was performed
+        detection_data = session_manager.get_detection_data(session_id)
+        anomaly_info = ""
+        if detection_data and detection_data.get("capture_data"):
+            anomalies_detected = []
+            capture_data = detection_data["capture_data"]
+            
+            for timestamp, detections in capture_data.items():
+                person_count = sum(1 for detection in detections if "person" in detection.lower())
+                device_count = sum(1 for detection in detections if any(device in detection.lower() for device in ["laptop", "phone", "cell phone", "tv", "remote", "computer", "monitor", "keyboard", "mouse"]))
+                
+                if person_count > 1:
+                    anomalies_detected.append(f"Multiple persons ({person_count})")
+                if device_count > 0:
+                    anomalies_detected.append(f"Digital devices ({device_count})")
+            
+            if anomalies_detected:
+                anomaly_info = f" | Anomalies detected: {', '.join(set(anomalies_detected))}"
+            else:
+                anomaly_info = " | No anomalies detected"
+        
         # Prepare response message
         if recording_info.storage_type == "supabase":
-            message = f"Recording uploaded to Supabase successfully: {filename}"
+            message = f"Raw recording uploaded to Supabase successfully: {recording_info.file_path}{anomaly_info}"
         else:
-            message = f"Recording saved locally (Supabase unavailable): {filename}"
+            message = f"Raw recording saved locally (Supabase unavailable): {recording_info.file_path}{anomaly_info}"
         
         return RecordingUploadResponse(
             success=True,
@@ -916,14 +1691,17 @@ async def list_session_recordings(session_id: str):
         # Get local recordings
         session_dir = session_manager.recordings_dir / session_id
         if session_dir.exists():
-            for file_path in session_dir.glob("*.webm"):
-                recordings.append({
-                    "filename": file_path.name,
-                    "file_path": str(file_path),
-                    "file_size": file_path.stat().st_size,
-                    "storage_type": "local",
-                    "upload_time": datetime.fromtimestamp(file_path.stat().st_mtime)
-                })
+            # Look for all video files
+            video_extensions = ["*.webm", "*.mp4", "*.avi", "*.mov", "*.mkv"]
+            for extension in video_extensions:
+                for file_path in session_dir.glob(extension):
+                    recordings.append({
+                        "filename": file_path.name,
+                        "file_path": str(file_path),
+                        "file_size": file_path.stat().st_size,
+                        "storage_type": "local",
+                        "upload_time": datetime.fromtimestamp(file_path.stat().st_mtime)
+                    })
         
         # Get Supabase recordings if available
         if SUPABASE_AVAILABLE and supabase_config.client:
@@ -1037,12 +1815,127 @@ async def delete_recording(session_id: str, filename: str):
         logger.error(f"Failed to delete recording {filename} for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/recordings/{session_id}/detection-data")
+async def get_detection_data(session_id: str):
+    """Get detection data for a session."""
+    try:
+        # Validate session exists
+        if session_id not in session_manager.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get detection data from session manager
+        detection_data = session_manager.get_detection_data(session_id)
+        
+        if detection_data is None:
+            return {
+                "session_id": session_id,
+                "detection_data_available": False,
+                "message": "No detection data found for this session"
+            }
+        
+        return {
+            "session_id": session_id,
+            "detection_data_available": True,
+            "detection_data": detection_data
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get detection data for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/recordings/{session_id}/anomalies")
+async def get_anomaly_detection_summary(session_id: str):
+    """Get anomaly detection summary for a session."""
+    try:
+        # Validate session exists
+        if session_id not in session_manager.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get detection data from session manager
+        detection_data = session_manager.get_detection_data(session_id)
+        
+        if detection_data is None:
+            return {
+                "session_id": session_id,
+                "anomalies_detected": False,
+                "message": "No detection data found for this session"
+            }
+        
+        # Analyze detection data for anomalies
+        anomalies_detected = []
+        if detection_data.get("capture_data"):
+            capture_data = detection_data["capture_data"]
+            
+            for timestamp, detections in capture_data.items():
+                # Count persons and devices more accurately
+                person_count = 0
+                device_count = 0
+                
+                for detection in detections:
+                    detection_lower = detection.lower()
+                    if "person" in detection_lower:
+                        person_count += 1
+                    elif any(device in detection_lower for device in ["laptop", "phone", "cell phone", "tv", "remote", "computer", "monitor", "keyboard", "mouse"]):
+                        device_count += 1
+                
+                # Flag anomalies: multiple people or devices detected
+                if person_count > 1:
+                    anomalies_detected.append({
+                        "timestamp": timestamp,
+                        "type": "multiple_persons",
+                        "count": person_count,
+                        "detections": detections,
+                        "description": f"Multiple persons detected in frame: {person_count} people"
+                    })
+                if device_count > 0:
+                    anomalies_detected.append({
+                        "timestamp": timestamp,
+                        "type": "devices_detected",
+                        "count": device_count,
+                        "detections": detections,
+                        "description": f"Digital devices detected in frame: {device_count} devices"
+                    })
+        
+        # Calculate summary statistics
+        total_frames_with_detections = len(detection_data.get("capture_data", {}))
+        total_frames_processed = detection_data.get("statistics", {}).get("processed_frames", 0)
+        total_person_detections = detection_data.get("statistics", {}).get("person_detections", 0)
+        total_device_detections = detection_data.get("statistics", {}).get("device_detections", 0)
+        
+        multiple_persons_count = sum(1 for anomaly in anomalies_detected if anomaly["type"] == "multiple_persons")
+        devices_count = sum(1 for anomaly in anomalies_detected if anomaly["type"] == "devices_detected")
+        
+        return {
+            "session_id": session_id,
+            "anomalies_detected": len(anomalies_detected) > 0,
+            "total_anomalies": len(anomalies_detected),
+            "anomaly_types": {
+                "multiple_persons": multiple_persons_count,
+                "devices_detected": devices_count
+            },
+            "detection_statistics": {
+                "total_frames_processed": total_frames_processed,
+                "total_frames_with_detections": total_frames_with_detections,
+                "total_person_detections": total_person_detections,
+                "total_device_detections": total_device_detections
+            },
+            "anomalies": anomalies_detected
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get anomaly detection summary for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # API endpoints
 @app.post("/sessions/create")
 async def create_session(model_request: ModelSelectionRequest):
     """Create a new interview session."""
-    session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    session_id = str(uuid.uuid4())  # Generate proper UUID
     
     try:
         session_data = session_manager.create_session(session_id, model_request)
@@ -1090,6 +1983,292 @@ async def delete_session(session_id: str):
         logger.error(f"Failed to delete session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/sessions/{session_id}/save")
+async def save_session_information(session_id: str):
+    """Manually save session information to database."""
+    try:
+        if session_id not in session_manager.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session_data = session_manager.sessions[session_id]
+        session_manager.save_session_to_database(session_id, session_data)
+        
+        return {
+            "status": "saved",
+            "session_id": session_id,
+            "message": "Session information saved to database successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/sessions/{session_id}/save-missed")
+async def save_missed_session(session_id: str):
+    """Manually save a missed session that may not be in memory anymore."""
+    try:
+        # Check if session is still in memory
+        if session_id in session_manager.sessions:
+            session_data = session_manager.sessions[session_id]
+            session_manager.save_session_to_database(session_id, session_data)
+            return {
+                "status": "saved",
+                "session_id": session_id,
+                "message": "Session information saved to database successfully"
+            }
+        else:
+            # Session not in memory, try to reconstruct from available data
+            logger.warning(f"Session {session_id} not in memory, attempting to reconstruct")
+            
+            # Check if we have recording info
+            recording_info = session_manager.get_recording_info(session_id)
+            if not recording_info:
+                raise HTTPException(status_code=404, detail="Session not found and no recording available")
+            
+            # Get recording URL
+            recording_url = recording_info.public_url if recording_info.public_url else None
+            
+            # Convert datetime to ISO format string for JSON serialization
+            upload_time = recording_info.upload_time
+            if upload_time and hasattr(upload_time, 'isoformat'):
+                upload_time = upload_time.isoformat()
+            
+            # Create minimal session data from recording info
+            session_data = {
+                "id": session_id,
+                "status": "completed",
+                "created_at": recording_info.upload_time,
+                "model_request": None,  # We don't have this info
+                "conversation_history": [],  # We don't have this info
+                "resume_content": "Not available"
+            }
+            
+            # Prepare minimal session information
+            session_information = {
+                "job_role": "Unknown",  # We don't have this info
+                "conversation_history": [],
+                "anomalies_detected": [],
+                "asr_model": "Unknown",
+                "llm_provider": "Unknown",
+                "llm_model": "Unknown"
+            }
+            
+            # Prepare data for interview_sessions table
+            session_record = {
+                "interviewee_id": None,
+                "template_id": None,
+                "start_time": upload_time,  # Use upload_time as start_time (converted to ISO string)
+                "status": "completed",
+                "session_information": session_information,
+                "resume_url": None,  # We don't have this info
+                "recording_url": recording_url
+            }
+            
+            # Try to save what we have
+            saved_session_id = supabase_config.save_interview_session(session_record)
+            if saved_session_id:
+                logger.info(f"Partial session {session_id} saved with recording URL: {recording_url}")
+                return {
+                    "status": "saved_partial",
+                    "session_id": session_id,
+                    "message": f"Partial session information saved (recording only: {recording_url})"
+                }
+            else:
+                raise HTTPException(status_code=500, detail="Failed to save partial session")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save missed session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/sessions/{session_id}/end")
+async def end_session(session_id: str):
+    """End a session gracefully - save information and then delete."""
+    try:
+        if session_id not in session_manager.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Save session information first
+        session_data = session_manager.sessions[session_id]
+        session_manager.save_session_to_database(session_id, session_data)
+        
+        # Then delete the session
+        session_manager.delete_session(session_id)
+        
+        return {
+            "status": "ended",
+            "session_id": session_id,
+            "message": "Session ended and information saved to database"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to end session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sessions/{session_id}/info")
+async def get_session_information(session_id: str):
+    """Get session information that would be saved to database."""
+    try:
+        if session_id not in session_manager.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session_data = session_manager.sessions[session_id]
+        
+        # Extract conversation history (excluding system prompt and initial "Hello")
+        conversation_history = []
+        for message in session_data.get("conversation_history", []):
+            if message.get("role") == "system":
+                continue  # Skip system prompt
+            if message.get("role") == "user" and message.get("content") == "Hello":
+                continue  # Skip initial "Hello"
+            conversation_history.append(message)
+        
+        # Get recording URL if available
+        recording_url = None
+        recording_info = session_manager.get_recording_info(session_id)
+        if recording_info and recording_info.public_url:
+            recording_url = recording_info.public_url
+        
+        # Get detection data for anomalies
+        detection_data = session_manager.get_detection_data(session_id)
+        anomalies_detected = []
+        if detection_data and detection_data.get("capture_data"):
+            # Analyze detection data for anomalies
+            capture_data = detection_data["capture_data"]
+            for timestamp, detections in capture_data.items():
+                # Count persons and devices more accurately
+                person_count = 0
+                device_count = 0
+                
+                for detection in detections:
+                    detection_lower = detection.lower()
+                    if "person" in detection_lower:
+                        person_count += 1
+                    elif any(device in detection_lower for device in ["laptop", "phone", "cell phone", "tv", "remote", "computer", "monitor", "keyboard", "mouse"]):
+                        device_count += 1
+                
+                # Flag anomalies: multiple people or devices detected
+                if person_count > 1:
+                    anomalies_detected.append({
+                        "timestamp": timestamp,
+                        "type": "multiple_persons",
+                        "count": person_count,
+                        "detections": detections,
+                        "description": f"Multiple persons detected in frame: {person_count} people"
+                    })
+                if device_count > 0:
+                    anomalies_detected.append({
+                        "timestamp": timestamp,
+                        "type": "devices_detected",
+                        "count": device_count,
+                        "detections": detections,
+                        "description": f"Digital devices detected in frame: {device_count} devices"
+                    })
+        
+        # Prepare session information (without date_of_interview, resume_url, recording_url)
+        session_information = {
+            "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
+            "conversation_history": conversation_history,
+            "anomalies_detected": anomalies_detected,
+            "asr_model": session_data.get("model_request").asr_model if session_data.get("model_request") else None,
+            "llm_provider": session_data.get("model_request").llm_provider if session_data.get("model_request") else None,
+            "llm_model": session_data.get("model_request").llm_model if session_data.get("model_request") else None
+        }
+        
+        return {
+            "session_id": session_id,
+            "start_time": session_data.get("created_at"),
+            "session_information": session_information,
+            "resume_url": session_data.get("model_request").resume_url if session_data.get("model_request") else None,
+            "recording_url": recording_url
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get session information for {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/job-templates")
+async def get_job_templates():
+    """Get available job templates from Supabase."""
+    try:
+        if SUPABASE_AVAILABLE and supabase_config.client:
+            # Query the job_templates table for active templates
+            response = supabase_config.client.table('job_templates').select('*').eq('is_active', True).execute()
+            
+            if response.data:
+                return {
+                    "job_templates": response.data
+                }
+            else:
+                return {
+                    "job_templates": []
+                }
+        else:
+            # Return sample data if Supabase is not available
+            return {
+                "job_templates": [
+                    {
+                        "template_id": "sample-1",
+                        "template_name": "Software Engineer",
+                        "job_role": "Software Engineer",
+                        "difficulty_level": "Intermediate",
+                        "estimated_duration": 30,
+                        "description": "Full-stack development role"
+                    },
+                    {
+                        "template_id": "sample-2", 
+                        "template_name": "Data Scientist",
+                        "job_role": "Data Scientist",
+                        "difficulty_level": "Advanced",
+                        "estimated_duration": 45,
+                        "description": "Machine learning and data analysis role"
+                    }
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Failed to fetch job templates: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch job templates: {str(e)}")
+
+@app.get("/user-resumes/{user_id}")
+async def get_user_resumes(user_id: str):
+    """Get resumes for a specific user from Supabase."""
+    try:
+        if SUPABASE_AVAILABLE and supabase_config.client:
+            # Query the user_profiles table for the specific user's resume
+            response = supabase_config.client.table('user_profiles').select('user_id, first_name, last_name, resume_url, resume_filename').eq('user_id', user_id).not_.is_('resume_url', 'null').execute()
+            
+            if response.data:
+                return {
+                    "user_resumes": response.data
+                }
+            else:
+                return {
+                    "user_resumes": []
+                }
+        else:
+            # Return sample data if Supabase is not available
+            return {
+                "user_resumes": [
+                    {
+                        "user_id": "23a0b603-e437-42d6-b1e0-6e0a1b983150",
+                        "first_name": "John",
+                        "last_name": "Doe",
+                        "resume_url": "23a0b603-e437-42d6-b1e0-6e0a1b983150/resume_1754526365292.pdf",
+                        "resume_filename": "resume_1754526365292.pdf"
+                    }
+                ]
+            }
+    except Exception as e:
+        logger.error(f"Failed to fetch user resumes for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch user resumes: {str(e)}")
+
 @app.get("/models")
 async def get_available_models():
     """Get available ASR and LLM models."""
@@ -1113,6 +2292,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             return
         
         logger.info(f"WebSocket ready for session {session_id}")
+        
+        # Update session activity
+        session_manager.update_session_activity(session_id)
 
         # --- NEW: Send opening AI message if available ---
         if session.get("last_response"):
@@ -1127,6 +2309,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             logger.debug(f"Waiting for audio data from session {session_id}")
             data = await websocket.receive_text()
             logger.debug(f"Received audio data from session {session_id}: {len(data)} chars")
+            
+            # Update session activity on each message
+            session_manager.update_session_activity(session_id)
             
             try:
                 audio_data = json.loads(data)
@@ -1161,9 +2346,27 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for session {session_id}")
+        # --- NEW: Auto-save session when WebSocket disconnects ---
+        try:
+            if session_id in session_manager.sessions:
+                logger.info(f"Auto-saving session {session_id} due to WebSocket disconnect")
+                session_data = session_manager.sessions[session_id]
+                session_manager.save_session_to_database(session_id, session_data)
+                logger.info(f"Session {session_id} auto-saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to auto-save session {session_id} on disconnect: {e}")
     except Exception as e:
         logger.error(f"WebSocket error for session {session_id}: {e}")
         await websocket.send_text(json.dumps({"error": str(e)}))
+        # --- NEW: Auto-save session on any WebSocket error ---
+        try:
+            if session_id in session_manager.sessions:
+                logger.info(f"Auto-saving session {session_id} due to WebSocket error")
+                session_data = session_manager.sessions[session_id]
+                session_manager.save_session_to_database(session_id, session_data)
+                logger.info(f"Session {session_id} auto-saved successfully after error")
+        except Exception as save_error:
+            logger.error(f"Failed to auto-save session {session_id} after error: {save_error}")
 
 if __name__ == "__main__":
     import uvicorn
