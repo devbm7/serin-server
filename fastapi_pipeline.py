@@ -2282,19 +2282,10 @@ async def get_available_models():
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     logger.info(f"WebSocket connection established for session {session_id}")
+    await websocket.accept()
     
     try:
-        await websocket.accept()
-        logger.info(f"WebSocket accepted for session {session_id}")
-        
-        # Get session with timeout
-        try:
-            session = session_manager.get_session(session_id)
-        except Exception as e:
-            logger.error(f"Failed to get session {session_id}: {e}")
-            await websocket.send_text(json.dumps({"error": f"Session not found: {str(e)}"}))
-            return
-        
+        session = session_manager.get_session(session_id)
         if session["status"] != "active":
             logger.warning(f"Session {session_id} is not active, status: {session['status']}")
             await websocket.send_text(json.dumps({"error": "Session is not active"}))
@@ -2305,140 +2296,78 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Update session activity
         session_manager.update_session_activity(session_id)
 
-        # Send opening AI message if available
+        # --- NEW: Send opening AI message if available ---
         if session.get("last_response"):
-            try:
-                response = session["last_response"]
-                session["last_response"] = None
-                response_json = response.json()
-                logger.debug(f"Sending opening response to session {session_id}: {len(response_json)} chars")
-                await websocket.send_text(response_json)
-                logger.info(f"Opening response sent successfully to session {session_id}")
-            except Exception as e:
-                logger.error(f"Failed to send opening response for session {session_id}: {e}")
+            response = session["last_response"]
+            session["last_response"] = None
+            response_json = response.json()
+            logger.debug(f"Sending opening response to session {session_id}: {len(response_json)} chars")
+            await websocket.send_text(response_json)
+            logger.info(f"Opening response sent successfully to session {session_id}")
         
-        # Main WebSocket loop with timeout
         while True:
+            logger.debug(f"Waiting for audio data from session {session_id}")
+            data = await websocket.receive_text()
+            logger.debug(f"Received audio data from session {session_id}: {len(data)} chars")
+            
+            # Update session activity on each message
+            session_manager.update_session_activity(session_id)
+            
             try:
-                # Use asyncio.wait_for to add timeout to receive operation
-                data = await asyncio.wait_for(
-                    websocket.receive_text(), 
-                    timeout=30.0  # 30 second timeout
-                )
-                logger.debug(f"Received audio data from session {session_id}: {len(data)} chars")
+                audio_data = json.loads(data)
+                logger.debug(f"Parsed audio data: type={audio_data.get('type')}, sample_rate={audio_data.get('sample_rate')}")
                 
-                # Update session activity on each message
-                session_manager.update_session_activity(session_id)
-                
-                # Process the received data
-                await process_websocket_message(websocket, session_id, session, data)
-                
-            except asyncio.TimeoutError:
-                logger.debug(f"WebSocket timeout for session {session_id}, sending ping")
-                try:
-                    await websocket.send_text(json.dumps({"type": "ping", "timestamp": time.time()}))
-                except Exception as ping_error:
-                    logger.error(f"Failed to send ping for session {session_id}: {ping_error}")
-                    break
+                if audio_data.get('type') == 'audio_chunk':
+                    # Decode audio data
+                    audio_bytes = base64.b64decode(audio_data['audio_data'])
+                    
+                    # Add to audio queue for processing
+                    try:
+                        session["audio_queue"].put_nowait(audio_bytes)
+                        logger.debug(f"Added audio chunk to queue for session {session_id}")
+                    except queue.Full:
+                        logger.warning(f"Audio queue full for session {session_id}, dropping chunk")
+                    
+                    # Check if there's a response ready
+                    if session.get("last_response") and not session["is_processing"]:
+                        response = session["last_response"]
+                        session["last_response"] = None
+                        response_json = response.json()
+                        logger.debug(f"Sending response to session {session_id}: {len(response_json)} chars")
+                        await websocket.send_text(response_json)
+                        logger.info(f"Response sent successfully to session {session_id}")
+            
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error for session {session_id}: {e}")
+                await websocket.send_text(json.dumps({"error": "Invalid JSON format"}))
             except Exception as e:
-                logger.error(f"Error in WebSocket loop for session {session_id}: {e}")
-                break
+                logger.error(f"Error processing audio for session {session_id}: {e}")
+                await websocket.send_text(json.dumps({"error": str(e)}))
     
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for session {session_id}")
-        await handle_websocket_disconnect(session_id)
+        # --- NEW: Auto-save session when WebSocket disconnects ---
+        try:
+            if session_id in session_manager.sessions:
+                logger.info(f"Auto-saving session {session_id} due to WebSocket disconnect")
+                session_data = session_manager.sessions[session_id]
+                session_manager.save_session_to_database(session_id, session_data)
+                logger.info(f"Session {session_id} auto-saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to auto-save session {session_id} on disconnect: {e}")
     except Exception as e:
         logger.error(f"WebSocket error for session {session_id}: {e}")
-        try:
-            await websocket.send_text(json.dumps({"error": str(e)}))
-        except:
-            pass
-        await handle_websocket_disconnect(session_id)
-
-async def process_websocket_message(websocket: WebSocket, session_id: str, session: dict, data: str):
-    """Process a single WebSocket message with proper error handling."""
-    try:
-        audio_data = json.loads(data)
-        logger.debug(f"Parsed audio data: type={audio_data.get('type')}, sample_rate={audio_data.get('sample_rate')}")
-        
-        if audio_data.get('type') == 'audio_chunk':
-            # Decode audio data with size limit
-            audio_base64 = audio_data['audio_data']
-            if len(audio_base64) > 1024 * 1024:  # 1MB limit
-                logger.warning(f"Audio data too large for session {session_id}: {len(audio_base64)} chars")
-                await websocket.send_text(json.dumps({"error": "Audio data too large"}))
-                return
-            
-            try:
-                audio_bytes = base64.b64decode(audio_base64)
-            except Exception as decode_error:
-                logger.error(f"Failed to decode audio data for session {session_id}: {decode_error}")
-                await websocket.send_text(json.dumps({"error": "Invalid audio data format"}))
-                return
-            
-            # Add to audio queue for processing with timeout
-            try:
-                # Use asyncio.wait_for to add timeout to queue operation
-                await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None, 
-                        lambda: session["audio_queue"].put(audio_bytes, timeout=1.0)
-                    ),
-                    timeout=2.0
-                )
-                logger.debug(f"Added audio chunk to queue for session {session_id}")
-            except (queue.Full, asyncio.TimeoutError):
-                logger.warning(f"Audio queue full for session {session_id}, dropping chunk")
-            except Exception as queue_error:
-                logger.error(f"Failed to add audio chunk to queue for session {session_id}: {queue_error}")
-            
-            # Check if there's a response ready
-            if session.get("last_response") and not session["is_processing"]:
-                try:
-                    response = session["last_response"]
-                    session["last_response"] = None
-                    response_json = response.json()
-                    logger.debug(f"Sending response to session {session_id}: {len(response_json)} chars")
-                    await websocket.send_text(response_json)
-                    logger.info(f"Response sent successfully to session {session_id}")
-                except Exception as response_error:
-                    logger.error(f"Failed to send response for session {session_id}: {response_error}")
-        
-        elif audio_data.get('type') == 'ping':
-            # Handle ping messages
-            await websocket.send_text(json.dumps({"type": "pong", "timestamp": time.time()}))
-            
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error for session {session_id}: {e}")
-        await websocket.send_text(json.dumps({"error": "Invalid JSON format"}))
-    except Exception as e:
-        logger.error(f"Error processing message for session {session_id}: {e}")
         await websocket.send_text(json.dumps({"error": str(e)}))
-
-async def handle_websocket_disconnect(session_id: str):
-    """Handle WebSocket disconnect with proper cleanup."""
-    try:
-        if session_id in session_manager.sessions:
-            logger.info(f"Auto-saving session {session_id} due to WebSocket disconnect")
-            session_data = session_manager.sessions[session_id]
-            session_manager.save_session_to_database(session_id, session_data)
-            logger.info(f"Session {session_id} auto-saved successfully")
-    except Exception as e:
-        logger.error(f"Failed to auto-save session {session_id} on disconnect: {e}")
+        # --- NEW: Auto-save session on any WebSocket error ---
+        try:
+            if session_id in session_manager.sessions:
+                logger.info(f"Auto-saving session {session_id} due to WebSocket error")
+                session_data = session_manager.sessions[session_id]
+                session_manager.save_session_to_database(session_id, session_data)
+                logger.info(f"Session {session_id} auto-saved successfully after error")
+        except Exception as save_error:
+            logger.error(f"Failed to auto-save session {session_id} after error: {save_error}")
 
 if __name__ == "__main__":
     import uvicorn
-    import ssl
-    
-    # SSL configuration (uncomment and configure for HTTPS)
-    # ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    # ssl_context.load_cert_chain("path/to/cert.pem", "path/to/key.pem")
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        # ssl_keyfile="path/to/key.pem",  # Uncomment for HTTPS
-        # ssl_certfile="path/to/cert.pem",  # Uncomment for HTTPS
-        # ssl_ca_certs="path/to/ca.pem",  # Uncomment for HTTPS
-    ) 
+    uvicorn.run(app, host="0.0.0.0", port=8000) 

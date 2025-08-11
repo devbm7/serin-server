@@ -1,2 +1,3 @@
 rf-detr-nano.pth
 __pycache__/
+fastapi_server.log
