@@ -1,0 +1,14 @@
+# WebSocket testing
+websockets>=11.0.3
+
+# HTTP requests
+requests>=2.31.0
+
+# Audio processing for tests
+numpy>=1.24.0
+
+# Async support
+asyncio-mqtt>=0.16.1
+
+# Optional: For better test output
+rich>=13.0.0

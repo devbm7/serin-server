@@ -1,0 +1,12 @@
+{
+  "session_id": "0f10ede2-6aab-493f-954e-6b72eec72072",
+  "capture_data": {},
+  "statistics": {
+    "total_frames": -138350580552821632,
+    "processed_frames": 404,
+    "detection_frames": 76,
+    "person_detections": 76,
+    "device_detections": 0
+  },
+  "timestamp": "2025-08-11T04:59:34.159434"
+}
