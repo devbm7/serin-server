@@ -71,30 +71,13 @@ def check_config_file():
         return False
     return True
 
-def check_resume_file():
-    """Check if resume file exists"""
-    try:
-        import yaml
-        with open('pipeline_config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-        
-        resume_file = config.get('paths', {}).get('resume_file', 'Resume v3.01.pdf')
-        if not Path(resume_file).exists():
-            print(f"Warning: Resume file '{resume_file}' not found.")
-            return False
-    except Exception as e:
-        print(f"Warning: Could not check resume file: {e}")
-        return False
-    
-    return True
-
 def check_supabase_config():
     """Check Supabase configuration"""
     try:
         from supabase_config import supabase_config
         
         if supabase_config.client:
-            print("✅ Supabase storage is available for recordings")
+            print("✅ Supabase storage is available for recordings and resumes")
             return True
         else:
             print("⚠️  Supabase storage is not available - recordings will be saved locally")
@@ -124,7 +107,6 @@ def main():
     # Check configuration
     print("Checking configuration...")
     check_config_file()
-    check_resume_file()
     check_supabase_config()
     
     # Get server configuration
@@ -132,7 +114,19 @@ def main():
     port = int(os.getenv("FASTAPI_PORT", "8000"))
     reload = os.getenv("FASTAPI_RELOAD", "false").lower() == "true"
     
-    print(f"Starting server on {host}:{port}")
+    # SSL configuration
+    ssl_keyfile = os.getenv("SSL_KEYFILE")
+    ssl_certfile = os.getenv("SSL_CERTFILE")
+    use_https = ssl_keyfile and ssl_certfile
+    
+    if use_https:
+        print(f"Starting HTTPS server on {host}:{port}")
+        print(f"SSL Key: {ssl_keyfile}")
+        print(f"SSL Cert: {ssl_certfile}")
+    else:
+        print(f"Starting HTTP server on {host}:{port}")
+        print("⚠️  For production, set SSL_KEYFILE and SSL_CERTFILE environment variables")
+    
     print(f"Auto-reload: {reload}")
     print("Press Ctrl+C to stop the server")
     print()
@@ -141,13 +135,20 @@ def main():
         # Import and run the FastAPI app
         from fastapi_pipeline import app
         
-        uvicorn.run(
-            "fastapi_pipeline:app",
-            host=host,
-            port=port,
-            reload=reload,
-            log_level="info"
-        )
+        # Configure uvicorn with SSL if certificates are provided
+        uvicorn_config = {
+            "app": "fastapi_pipeline:app",
+            "host": host,
+            "port": port,
+            "reload": reload,
+            "log_level": "info"
+        }
+        
+        if use_https:
+            uvicorn_config["ssl_keyfile"] = ssl_keyfile
+            uvicorn_config["ssl_certfile"] = ssl_certfile
+        
+        uvicorn.run(**uvicorn_config)
     except KeyboardInterrupt:
         print("\nServer stopped by user")
     except Exception as e:
