@@ -78,15 +78,15 @@ try:
     from config import get_gemini_api_key, validate_gemini_config
     # Validate Gemini configuration on startup
     if validate_gemini_config():
-        print("✅ Gemini configuration validated successfully")
+        print("Gemini configuration validated successfully")
     else:
-        print("⚠️  Gemini configuration issues detected")
+        print("Gemini configuration issues detected")
 except ImportError:
-    print("⚠️  Could not import config module")
+    print("Could not import config module")
     # Fallback to direct environment variable
     if 'GEMINI_API_KEY' not in os.environ:
         os.environ['GEMINI_API_KEY'] = "AIzaSyD-987BdBsdKnCa7oWZktY9_1K27hS-qY8"
-        print("⚠️  Using default Gemini API key. For production, set GEMINI_API_KEY environment variable.")
+        print("Using default Gemini API key. For production, set GEMINI_API_KEY environment variable.")
 
 # Configure logging
 logging.basicConfig(
