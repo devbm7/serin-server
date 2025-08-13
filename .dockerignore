@@ -1,8 +1,0 @@
-
-.git
-.gitignore
-Dockerfile
-.env
-.env.local
-env.example
-README.md
