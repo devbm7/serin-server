@@ -52,5 +52,17 @@ def validate_gemini_config() -> bool:
         print(f"Gemini API key validation failed: {e}")
         return False
 
+def get_model_preload_config() -> dict:
+    """Get model preloading configuration"""
+    return {
+        "preload_asr_models": os.environ.get('PRELOAD_ASR_MODELS', 'true').lower() == 'true',
+        "asr_models_to_preload": os.environ.get('ASR_MODELS_TO_PRELOAD', 'openai/whisper-medium,openai/whisper-small').split(','),
+        "preload_vad": os.environ.get('PRELOAD_VAD', 'true').lower() == 'true',
+        "preload_tts": os.environ.get('PRELOAD_TTS', 'true').lower() == 'true',
+        "preload_llm_client": os.environ.get('PRELOAD_LLM_CLIENT', 'true').lower() == 'true',
+        "preload_video_processor": os.environ.get('PRELOAD_VIDEO_PROCESSOR', 'true').lower() == 'true',
+        "enable_gpu_cleanup": os.environ.get('ENABLE_GPU_CLEANUP', 'true').lower() == 'true'
+    }
+
 # Load environment on import
 load_environment() 

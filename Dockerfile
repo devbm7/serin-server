@@ -1,0 +1,30 @@
+# Use an official Python runtime as a parent image
+FROM python:3.12.8
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Install system dependencies for pyaudio
+RUN apt-get update && apt-get install -y portaudio19-dev && rm -rf /var/lib/apt/lists/*
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt . 
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt --upgrade
+
+# Copy the specified Python files into the container at /app
+COPY config.py .
+COPY supabase_config.py .
+COPY fastapi_pipeline.py .
+COPY start_fastapi_server.py .
+COPY pipeline_config.yaml .
+COPY .env .
+COPY .env.local .
+
+
+# Expose port 8000 for the FastAPI application
+EXPOSE 8000
+
+# Run start_fastapi_server.py when the container launches
+CMD ["python", "start_fastapi_server.py"]
