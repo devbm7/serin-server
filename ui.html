@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InterviewAI - Automated Interview Platform</title>
+    <style>
+        :root {
+            /* Primary Colors */
+            --primary: #1e40af;
+            --secondary: #3b82f6;
+            --accent: #06b6d4;
+            
+            /* Supporting Colors */
+            --neutral: #64748b;
+            --background: #ffffff;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #dc2626;
+            
+            /* Text Colors */
+            --text-primary: #1f2937;
+            --text-secondary: #4b5563;
+            --text-muted: #9ca3af;
+            
+            /* Interactive States */
+            --primary-hover: #1d4ed8;
+            --secondary-hover: #2563eb;
+            --accent-hover: #0891b2;
+            
+            /* Gradients */
+            --gradient-primary: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%);
+            --gradient-accent: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%);
+            --gradient-subtle: linear-gradient(135deg, #ffffff 0%, #f0f9ff 100%);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: var(--text-primary);
+            overflow-x: hidden;
+        }
+
+        .hero {
+            min-height: 100vh;
+            background: var(--gradient-primary);
+            position: relative;
+            display: flex;
+            align-items: center;
+            overflow: hidden;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><pattern id="grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M 10 0 L 0 0 0 10" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="0.5"/></pattern></defs><rect width="100" height="100" fill="url(%23grid)"/></svg>');
+            opacity: 0.3;
+        }
+
+        .floating-shapes {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            z-index: 1;
+        }
+
+        .shape {
+            position: absolute;
+            background: rgba(6, 182, 212, 0.15);
+            border-radius: 50%;
+            animation: float 8s ease-in-out infinite;
+        }
+
+        .shape:nth-child(1) {
+            width: 100px;
+            height: 100px;
+            top: 15%;
+            left: 8%;
+            animation-delay: 0s;
+        }
+
+        .shape:nth-child(2) {
+            width: 150px;
+            height: 150px;
+            top: 65%;
+            right: 12%;
+            animation-delay: 3s;
+        }
+
+        .shape:nth-child(3) {
+            width: 80px;
+            height: 80px;
+            top: 8%;
+            right: 30%;
+            animation-delay: 6s;
+        }
+
+        .shape:nth-child(4) {
+            width: 120px;
+            height: 120px;
+            top: 45%;
+            left: 5%;
+            animation-delay: 1.5s;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) rotate(0deg); opacity: 0.1; }
+            50% { transform: translateY(-30px) rotate(180deg); opacity: 0.2; }
+        }
+
+        .navbar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(100, 116, 139, 0.1);
+            padding: 1rem 0;
+            transition: all 0.3s ease;
+        }
+
+        .nav-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 1.75rem;
+            font-weight: 800;
+            color: var(--primary);
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+
+        .logo:hover {
+            color: var(--primary-hover);
+        }
+
+        .nav-links {
+            display: flex;
+            list-style: none;
+            gap: 2.5rem;
+        }
+
+        .nav-links a {
+            text-decoration: none;
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 1rem;
+            transition: color 0.3s ease;
+            position: relative;
+        }
+
+        .nav-links a:hover {
+            color: var(--primary);
+        }
+
+        .nav-links a::after {
+            content: '';
+            position: absolute;
+            bottom: -5px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: var(--accent);
+            transition: width 0.3s ease;
+        }
+
+        .nav-links a:hover::after {
+            width: 100%;
+        }
+
+        .cta-nav {
+            background: var(--primary);
+            color: var(--background);
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.95rem;
+            transition: all 0.3s ease;
+            border: 2px solid var(--primary);
+        }
+
+        .cta-nav:hover {
+            background: var(--primary-hover);
+            border-color: var(--primary-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(30, 64, 175, 0.3);
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            position: relative;
+            z-index: 10;
+        }
+
+        .hero-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5rem;
+            align-items: center;
+            min-height: 80vh;
+            padding-top: 6rem;
+        }
+
+        .hero-text {
+            color: var(--background);
+        }
+
+        .hero-text h1 {
+            font-size: 3.75rem;
+            font-weight: 800;
+            line-height: 1.1;
+            margin-bottom: 1.5rem;
+            background: linear-gradient(135deg, #ffffff 0%, #e0f2fe 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-text .highlight {
+            background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            position: relative;
+        }
+
+        .hero-text p {
+            font-size: 1.25rem;
+            margin-bottom: 2.5rem;
+            opacity: 0.95;
+            line-height: 1.7;
+            color: #e0f2fe;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1.25rem;
+            margin-bottom: 4rem;
+        }
+
+        .btn {
+            padding: 1rem 2rem;
+            border-radius: 12px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1.1rem;
+            border: 2px solid transparent;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--background);
+            border-color: var(--accent);
+            box-shadow: 0 10px 30px rgba(6, 182, 212, 0.3);
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+            transform: translateY(-3px);
+            box-shadow: 0 15px 40px rgba(6, 182, 212, 0.4);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--background);
+            border-color: rgba(255, 255, 255, 0.3);
+            backdrop-filter: blur(10px);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: rgba(255, 255, 255, 0.5);
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(255, 255, 255, 0.1);
+        }
+
+        .stats {
+            display: flex;
+            gap: 3rem;
+        }
+
+        .stat {
+            text-align: left;
+        }
+
+        .stat-number {
+            font-size: 2.25rem;
+            font-weight: 800;
+            color: var(--accent);
+            display: block;
+            line-height: 1.1;
+        }
+
+        .stat-label {
+            font-size: 0.95rem;
+            opacity: 0.85;
+            margin-top: 0.5rem;
+            color: #e0f2fe;
+        }
+
+        .hero-visual {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .dashboard-mockup {
+            background: var(--background);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 
+                0 25px 60px rgba(0, 0, 0, 0.2),
+                0 8px 25px rgba(30, 64, 175, 0.1);
+            border: 1px solid rgba(100, 116, 139, 0.1);
+            transform: perspective(1000px) rotateY(-10deg) rotateX(5deg);
+            transition: transform 0.5s ease;
+            width: 100%;
+            max-width: 480px;
+        }
+
+        .dashboard-mockup:hover {
+            transform: perspective(1000px) rotateY(-5deg) rotateX(2deg);
+        }
+
+        .mockup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(100, 116, 139, 0.15);
+        }
+
+        .mockup-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .status-badge {
+            background: var(--success);
+            color: var(--background);
+            padding: 0.4rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            background: var(--background);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .interview-card {
+            background: var(--gradient-subtle);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid var(--primary);
+            border: 1px solid rgba(100, 116, 139, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        .interview-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(30, 64, 175, 0.1);
+        }
+
+        .candidate-info {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .avatar {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: var(--gradient-accent);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--background);
+            font-weight: 700;
+            font-size: 1.1rem;
+        }
+
+        .candidate-details h4 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 0.25rem;
+        }
+
+        .candidate-details p {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .progress-section {
+            margin-bottom: 1rem;
+        }
+
+        .progress-label {
+            display: flex;
+            justify-content: between;
+            align-items: center;
+            margin-bottom: 0.5rem;
+        }
+
+        .progress-text {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .progress-bar {
+            background: rgba(100, 116, 139, 0.15);
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-fill {
+            background: var(--gradient-accent);
+            height: 100%;
+            width: 75%;
+            border-radius: 4px;
+            position: relative;
+            transition: width 0.5s ease;
+        }
+
+        .progress-fill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.4), transparent);
+            animation: shimmer 2.5s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .metric-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.85rem;
+        }
+
+        .metric-label {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .metric-value {
+            color: var(--primary);
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            .hero-content {
+                grid-template-columns: 1fr;
+                gap: 3rem;
+                text-align: center;
+                padding-top: 5rem;
+            }
+
+            .hero-text h1 {
+                font-size: 2.75rem;
+            }
+
+            .cta-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+
+            .stats {
+                justify-content: center;
+                gap: 2rem;
+            }
+
+            .dashboard-mockup {
+                transform: none;
+                margin-top: 2rem;
+            }
+
+            .nav-links {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-container">
+            <a href="#" class="logo">InterviewAI</a>
+            <ul class="nav-links">
+                <li><a href="#features">Features</a></li>
+                <li><a href="#pricing">Pricing</a></li>
+                <li><a href="#resources">Resources</a></li>
+                <li><a href="#contact">Contact</a></li>
+            </ul>
+            <a href="#" class="cta-nav">Start Free Trial</a>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <div class="floating-shapes">
+            <div class="shape"></div>
+            <div class="shape"></div>
+            <div class="shape"></div>
+            <div class="shape"></div>
+        </div>
+
+        <div class="container">
+            <div class="hero-content">
+                <div class="hero-text">
+                    <h1>Transform Your <span class="highlight">Hiring Process</span> with AI Intelligence</h1>
+                    <p>Streamline recruitment with automated interviews that assess candidates fairly, save valuable time, and identify top talent with precision-driven AI technology.</p>
+                    
+                    <div class="cta-buttons">
+                        <a href="#" class="btn btn-primary">
+                            Start Free Trial
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M5 12h14M12 5l7 7-7 7"/>
+                            </svg>
+                        </a>
+                        <a href="#" class="btn btn-secondary">
+                            Watch Demo
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="5,3 19,12 5,21"/>
+                            </svg>
+                        </a>
+                    </div>
+
+                    <div class="stats">
+                        <div class="stat">
+                            <span class="stat-number">85%</span>
+                            <span class="stat-label">Time Reduction</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-number">500+</span>
+                            <span class="stat-label">Enterprise Clients</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-number">50K+</span>
+                            <span class="stat-label">Interviews Conducted</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="hero-visual">
+                    <div class="dashboard-mockup">
+                        <div class="mockup-header">
+                            <h3 class="mockup-title">Live Interview Dashboard</h3>
+                            <div class="status-badge">
+                                <div class="status-dot"></div>
+                                Live
+                            </div>
+                        </div>
+                        
+                        <div class="interview-card">
+                            <div class="candidate-info">
+                                <div class="avatar">JS</div>
+                                <div class="candidate-details">
+                                    <h4>John Smith</h4>
+                                    <p>Senior Software Engineer • 42 min</p>
+                                </div>
+                            </div>
+                            <div class="progress-section">
+                                <div class="progress-label">
+                                    <span class="progress-text">Interview Progress</span>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: 78%;"></div>
+                                </div>
+                            </div>
+                            <div class="metrics">
+                                <div class="metric-item">
+                                    <span class="metric-label">Technical Skills</span>
+                                    <span class="metric-value">8.5/10</span>
+                                </div>
+                                <div class="metric-item">
+                                    <span class="metric-label">Communication</span>
+                                    <span class="metric-value">9.2/10</span>
+                                </div>
+                                <div class="metric-item">
+                                    <span class="metric-label">Problem Solving</span>
+                                    <span class="metric-value">8.8/10</span>
+                                </div>
+                                <div class="metric-item">
+                                    <span class="metric-label">Overall Match</span>
+                                    <span class="metric-value">92%</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="interview-card">
+                            <div class="candidate-info">
+                                <div class="avatar">AM</div>
+                                <div class="candidate-details">
+                                    <h4>Anna Martinez</h4>
+                                    <p>Product Manager • 28 min</p>
+                                </div>
+                            </div>
+                            <div class="progress-section">
+                                <div class="progress-label">
+                                    <span class="progress-text">Interview Progress</span>
+                                </div>
+                                <div class="progress-bar">
+                                    <div class="progress-fill" style="width: 65%;"></div>
+                                </div>
+                            </div>
+                            <div class="metrics">
+                                <div class="metric-item">
+                                    <span class="metric-label">Leadership</span>
+                                    <span class="metric-value">9.1/10</span>
+                                </div>
+                                <div class="metric-item">
+                                    <span class="metric-label">Strategy</span>
+                                    <span class="metric-value">8.7/10</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+</body>
+</html>

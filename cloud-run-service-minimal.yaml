@@ -1,0 +1,52 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: interview-agent
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/memory: "4Gi"
+        run.googleapis.com/cpu: "2"
+        run.googleapis.com/timeout: "3600"
+        run.googleapis.com/concurrency: "80"
+        run.googleapis.com/max-instances: "10"
+        run.googleapis.com/min-instances: "1"
+    spec:
+      serviceAccountName: interview-agent-sa@project-polaris-465312.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 3600
+      containers:
+      - image: gcr.io/project-polaris-465312/interview-agent:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: FASTAPI_HOST
+          value: "0.0.0.0"
+        - name: FASTAPI_RELOAD
+          value: "false"
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: gemini-api-key
+              key: latest
+        - name: SUPABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: supabase-url
+              key: latest
+        - name: SUPABASE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: supabase-key
+              key: latest
+        resources:
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+          requests:
+            cpu: "2"
+            memory: "4Gi"

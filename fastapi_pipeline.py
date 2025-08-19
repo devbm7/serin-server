@@ -8,9 +8,10 @@ import queue
 import threading
 import time
 import uuid
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
 from pathlib import Path
+import sys
 
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
@@ -18,7 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import requests
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+import subprocess
+ 
 import PyPDF2
 
 # Video processing imports
@@ -85,8 +87,18 @@ except ImportError:
     print("Could not import config module")
     # Fallback to direct environment variable
     if 'GEMINI_API_KEY' not in os.environ:
-        os.environ['GEMINI_API_KEY'] = "AIzaSyD-987BdBsdKnCa7oWZktY9_1K27hS-qY8"
+        os.environ['GEMINI_API_KEY'] = "AIzaSyA_lZ78Rf_J9lCBqpu4hFaHSzYopB4CY0Y"
         print("Using default Gemini API key. For production, set GEMINI_API_KEY environment variable.")
+
+# Google GenAI for ASR
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_ASR_AVAILABLE = True
+    logging.info("Google GenAI ASR available")
+except ImportError:
+    GEMINI_ASR_AVAILABLE = False
+    logging.warning("Google GenAI not available for ASR")
 
 # Configure logging
 logging.basicConfig(
@@ -94,6 +106,29 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Current POC directory (directory of this file)
+POC_DIR = Path(__file__).resolve().parent
+
+# Helper to check if ASR is ready (Gemini + API key available)
+def is_asr_ready() -> bool:
+    try:
+        try:
+            from config import get_gemini_api_key, validate_gemini_config
+            if not validate_gemini_config():
+                return False
+            key = get_gemini_api_key()
+        except Exception:
+            key = os.environ.get('GEMINI_API_KEY')
+        return GEMINI_ASR_AVAILABLE and bool(key)
+    except Exception:
+        return False
+
+# Suppress specific warnings
+import warnings
+warnings.filterwarnings("ignore", message="dropout option adds dropout")
+warnings.filterwarnings("ignore", message="torch.nn.utils.weight_norm is deprecated")
+warnings.filterwarnings("ignore", message="copying from a non-meta parameter")
 
 app = FastAPI()
 
@@ -105,7 +140,8 @@ app.add_middleware(
         "https://www.blinkhire.vercel.app",
         "http://localhost:3000",
         "http://localhost:3001",
-        "https://api.devbm.site"  # Allow self-origin for WebSocket
+        "https://api.devbm.site",  # Allow self-origin for WebSocket
+        "wss://api.devbm.site"     # Allow WebSocket connections
     ],
     allow_credentials=True,  # Changed to True for WebSocket support
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -117,38 +153,35 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     """Health check endpoint for load balancer and monitoring."""
-    # Check preloaded models status
-    model_status = {
-        "asr_models": {},
-        "vad_processor": False,
-        "tts_processor": False,
-        "llm_client": False,
-        "video_processor": False
+    # Check if models are loaded
+    models_ready = {
+        "asr_ready": is_asr_ready(),
+        "tts_processor": model_cache.get("tts_processor") is not None,
+        "vad_processor": model_cache.get("vad_processor") is not None
     }
     
-    # Check ASR models
-    if 'preloaded_asr_models' in globals():
-        for model_name in preloaded_asr_models:
-            model_status["asr_models"][model_name] = True
-    
-    # Check other processors
-    if 'preloaded_vad_processor' in globals():
-        model_status["vad_processor"] = preloaded_vad_processor is not None
-    
-    if 'preloaded_tts_processor' in globals():
-        model_status["tts_processor"] = preloaded_tts_processor is not None
-    
-    if 'preloaded_llm_client' in globals():
-        model_status["llm_client"] = preloaded_llm_client is not None
-    
-    if 'preloaded_video_processor' in globals():
-        model_status["video_processor"] = preloaded_video_processor is not None
+    all_models_ready = all(models_ready.values())
     
     return {
-        "status": "healthy", 
+        "status": "healthy" if all_models_ready else "initializing",
         "timestamp": datetime.now().isoformat(),
-        "preloaded_models": model_status,
-        "active_sessions": len(session_manager.sessions)
+        "models_ready": models_ready,
+        "all_models_ready": all_models_ready,
+        "websocket_support": True,
+        "endpoints": {
+            "health": "/health",
+            "websocket": "/ws/{session_id}",
+            "sessions": "/sessions/create"
+        }
+    }
+
+@app.get("/ws-health")
+async def websocket_health_check():
+    """WebSocket health check endpoint."""
+    return {
+        "status": "healthy",
+        "websocket_support": True,
+        "timestamp": datetime.now().isoformat()
     }
 
 # Add startup event to preload models
@@ -157,138 +190,89 @@ async def startup_event():
     """Preload models and initialize resources on startup."""
     logger.info("Starting FastAPI application...")
     try:
-        # Preload common models to reduce cold start time
-        logger.info("Preloading models...")
+        # Preload all models synchronously to ensure they are ready
+        logger.info("Preloading models synchronously...")
         
-        # Get model preloading configuration
-        from config import get_model_preload_config
-        preload_config = get_model_preload_config()
-        logger.info(f"Model preloading configuration: {preload_config}")
+        # Initialize global model cache
+        global model_cache
+        model_cache = {
+            "tts_processor": None,
+            "vad_processor": None
+        }
         
-        # Preload ASR models (common models)
-        if preload_config["preload_asr_models"]:
-            logger.info("Preloading ASR models...")
-            global preloaded_asr_models
-            preloaded_asr_models = {}
-            asr_models_to_load = preload_config["asr_models_to_preload"]
-            
-            for model_name in asr_models_to_load:
-                try:
-                    logger.info(f"Loading ASR model: {model_name}")
-                    preloaded_asr_models[model_name] = ASRProcessor(model_name)
-                    logger.info(f"Successfully loaded ASR model: {model_name}")
-                except Exception as e:
-                    logger.warning(f"Failed to load ASR model {model_name}: {e}")
-        else:
-            logger.info("ASR model preloading disabled by configuration")
-            preloaded_asr_models = {}
+        # Load TTS processor synchronously
+        logger.info("Loading TTS processor...")
+        await preload_tts_processor()
         
-        # Preload VAD processor
-        if preload_config["preload_vad"]:
-            logger.info("Preloading VAD processor...")
-            global preloaded_vad_processor
-            try:
-                preloaded_vad_processor = VADProcessor()
-                logger.info("Successfully loaded VAD processor")
-            except Exception as e:
-                logger.warning(f"Failed to load VAD processor: {e}")
-                preloaded_vad_processor = None
-        else:
-            logger.info("VAD processor preloading disabled by configuration")
-            preloaded_vad_processor = None
+        # Load VAD processor synchronously
+        logger.info("Loading VAD processor...")
+        await preload_vad_processor()
         
-        # Preload TTS processor
-        if preload_config["preload_tts"]:
-            logger.info("Preloading TTS processor...")
-            global preloaded_tts_processor
-            try:
-                preloaded_tts_processor = TTSProcessor()
-                logger.info("Successfully loaded TTS processor")
-            except Exception as e:
-                logger.warning(f"Failed to load TTS processor: {e}")
-                preloaded_tts_processor = None
-        else:
-            logger.info("TTS processor preloading disabled by configuration")
-            preloaded_tts_processor = None
-        
-        # Preload video annotation processor if available
-        if preload_config["preload_video_processor"] and VIDEO_PROCESSING_AVAILABLE:
-            logger.info("Preloading video annotation processor...")
-            global preloaded_video_processor
-            try:
-                preloaded_video_processor = VideoAnnotationProcessor()
-                logger.info("Successfully loaded video annotation processor")
-            except Exception as e:
-                logger.warning(f"Failed to load video annotation processor: {e}")
-                preloaded_video_processor = None
-        else:
-            preloaded_video_processor = None
-            if not preload_config["preload_video_processor"]:
-                logger.info("Video processor preloading disabled by configuration")
-            else:
-                logger.info("Video processing libraries not available, skipping video annotation processor")
-        
-        # Preload LiteLLM client
-        if preload_config["preload_llm_client"]:
-            logger.info("Preloading LiteLLM client...")
-            global preloaded_llm_client
-            try:
-                preloaded_llm_client = LiteLLMClient()
-                logger.info("Successfully loaded LiteLLM client")
-            except Exception as e:
-                logger.warning(f"Failed to load LiteLLM client: {e}")
-                preloaded_llm_client = None
-        else:
-            logger.info("LLM client preloading disabled by configuration")
-            preloaded_llm_client = None
-        
-        # Log startup summary
-        logger.info("=== APPLICATION STARTUP COMPLETED ===")
-        logger.info(f"Preloaded ASR models: {list(preloaded_asr_models.keys()) if 'preloaded_asr_models' in globals() else 'None'}")
-        logger.info(f"VAD processor: {'Loaded' if 'preloaded_vad_processor' in globals() and preloaded_vad_processor else 'Failed'}")
-        logger.info(f"TTS processor: {'Loaded' if 'preloaded_tts_processor' in globals() and preloaded_tts_processor else 'Failed'}")
-        logger.info(f"LLM client: {'Loaded' if 'preloaded_llm_client' in globals() and preloaded_llm_client else 'Failed'}")
-        logger.info(f"Video processor: {'Loaded' if 'preloaded_video_processor' in globals() and preloaded_video_processor else 'Failed'}")
-        logger.info("=== READY TO ACCEPT REQUESTS ===")
+        logger.info("All models loaded successfully - application ready")
     except Exception as e:
         logger.error(f"Startup error: {e}")
         raise
 
-# Add shutdown event to clean up resources
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up resources on shutdown."""
-    logger.info("Shutting down FastAPI application...")
+model_cache = {}
+
+async def preload_tts_processor():
+    """Preload TTS processor in background."""
     try:
-        # Get configuration for cleanup
-        from config import get_model_preload_config
-        preload_config = get_model_preload_config()
+        logger.info("Preloading TTS processor...")
         
-        # Clean up preloaded models
-        if 'preloaded_asr_models' in globals():
-            for model_name, processor in preloaded_asr_models.items():
-                try:
-                    # Clear CUDA cache if using GPU and cleanup is enabled
-                    if preload_config["enable_gpu_cleanup"] and hasattr(processor, 'device') and processor.device == 'cuda':
-                        torch.cuda.empty_cache()
-                    logger.info(f"Cleaned up ASR model: {model_name}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up ASR model {model_name}: {e}")
-        
-        # Clean up other processors
-        if 'preloaded_video_processor' in globals() and preloaded_video_processor is not None:
+        def load_tts():
             try:
-                if hasattr(preloaded_video_processor, 'model'):
-                    del preloaded_video_processor.model
-                if preload_config["enable_gpu_cleanup"]:
-                    torch.cuda.empty_cache()
-                logger.info("Cleaned up video annotation processor")
+                if not KPipeline:
+                    logger.warning("Kokoro TTS not available")
+                    return None
+                pipeline = KPipeline(lang_code='a')
+                
+                return pipeline
             except Exception as e:
-                logger.warning(f"Failed to clean up video processor: {e}")
+                logger.error(f"Failed to preload TTS processor: {e}")
+                return None
         
-        logger.info("Application shutdown completed")
+        # Run in thread pool
+        loop = asyncio.get_event_loop()
+        pipeline = await loop.run_in_executor(None, load_tts)
+        
+        if pipeline:
+            model_cache["tts_processor"] = pipeline
+            logger.info("TTS processor preloaded successfully")
+        else:
+            logger.warning("Failed to preload TTS processor")
+            
     except Exception as e:
-        logger.error(f"Shutdown error: {e}")
+        logger.error(f"Error preloading TTS processor: {e}")
+
+async def preload_vad_processor():
+    """Preload VAD processor in background."""
+    try:
+        logger.info("Preloading VAD processor...")
+        
+        def load_vad():
+            try:
+                if not load_silero_vad:
+                    logger.warning("Silero VAD not available")
+                    return None
+                model = load_silero_vad()
+                return model
+            except Exception as e:
+                logger.error(f"Failed to preload VAD processor: {e}")
+                return None
+        
+        # Run in thread pool
+        loop = asyncio.get_event_loop()
+        model = await loop.run_in_executor(None, load_vad)
+        
+        if model:
+            model_cache["vad_processor"] = model
+            logger.info("VAD processor preloaded successfully")
+        else:
+            logger.warning("Failed to preload VAD processor")
+            
+    except Exception as e:
+        logger.error(f"Error preloading VAD processor: {e}")
 
 def read_resume_content(resume_file: str) -> str:
     """Read resume content from either local file or Supabase storage."""
@@ -401,9 +385,16 @@ class ModelSelectionRequest(BaseModel):
     job_role: str  # From job template
     user_id: str   # User ID for resume
     resume_url: str  # Direct path to resume in Supabase storage
-    asr_model: str = "openai/whisper-medium"  # Updated default
-    llm_provider: str = "gemini"  # Changed to gemini
-    llm_model: str = "gemini-2.5-flash"  # Changed to gemini-2.5-flash
+    # Removed user-provided model options - will use preloaded models only
+
+class SessionInitializationRequest(BaseModel):
+    session_id: str  # Database session ID
+    job_role: str  # From job template
+    user_id: str   # User ID for resume
+    resume_url: str  # Direct path to resume in Supabase storage
+    llm_provider: str = "gemini"
+    llm_model: str = "gemini-2.5-flash"
+    asr_model: str = "gemini-2.5-pro"
 
 class AudioChunk(BaseModel):
     type: str
@@ -782,6 +773,8 @@ class SessionManager:
         self.session_counters: Dict[str, int] = {}
         # Add recordings storage
         self.recordings: Dict[str, RecordingInfo] = {}
+        # Track whether post-processing has been started for a session
+        self.postprocess_started: Set[str] = set()
         
         # Create recordings directory for fallback local storage
         self.recordings_dir = Path("recordings")
@@ -793,15 +786,12 @@ class SessionManager:
         self.sessions_dir.mkdir(exist_ok=True)
         logger.info(f"Sessions directory: {self.sessions_dir.absolute()}")
         
-        # Use preloaded video annotation processor if available
+        # Initialize video annotation processor if available
         self.video_processor = None
-        if 'preloaded_video_processor' in globals() and preloaded_video_processor is not None:
-            self.video_processor = preloaded_video_processor
-            logger.info("Using preloaded video annotation processor")
-        elif VIDEO_PROCESSING_AVAILABLE:
+        if VIDEO_PROCESSING_AVAILABLE:
             try:
                 self.video_processor = VideoAnnotationProcessor()
-                logger.info("Video annotation processor initialized successfully (fallback)")
+                logger.info("Video annotation processor initialized successfully")
             except Exception as e:
                 logger.warning(f"Failed to initialize video annotation processor: {e}")
         else:
@@ -821,6 +811,47 @@ class SessionManager:
         self.cleanup_thread = threading.Thread(target=self._session_cleanup_worker, daemon=True)
         self.cleanup_thread.start()
         logger.info("Session cleanup thread started")
+
+    def _run_script_background(self, script_path: Path, session_id: str, job_name: str):
+        """Run a Python script in background with --session-id, capturing logs."""
+        try:
+            logs_dir = (self.sessions_dir / "postprocess_logs")
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            log_file_path = logs_dir / f"{session_id}_{job_name}.log"
+
+            # Open in binary append mode to avoid encoding issues
+            log_file = open(log_file_path, "ab")
+
+            cmd = [sys.executable, str(script_path), "--session-id", session_id]
+            subprocess.Popen(
+                cmd,
+                cwd=str(POC_DIR),
+                stdout=log_file,
+                stderr=log_file,
+            )
+            logger.info(f"Started {job_name} script for session {session_id}: {script_path}")
+        except Exception as e:
+            logger.error(f"Failed to start {job_name} script for session {session_id} at {script_path}: {e}")
+
+    def start_post_session_jobs(self, session_id: str):
+        """Start Evaluation and JSON-to-PDF scripts once session is saved."""
+        try:
+            # Use scripts from current poc directory only
+            eval_script = POC_DIR / "Evaluation_Module_Gemini_V1.0.py"
+            pdf_script = POC_DIR / "json_to_pdf.py"
+
+            if not eval_script.exists():
+                logger.warning("Evaluation Module script not found in poc directory")
+            else:
+                self._run_script_background(eval_script, session_id, "evaluation")
+
+            if not pdf_script.exists():
+                logger.warning("JSON to PDF module script not found in poc directory")
+            else:
+                self._run_script_background(pdf_script, session_id, "json_to_pdf")
+
+        except Exception as e:
+            logger.error(f"Failed to start post-session jobs for session {session_id}: {e}")
     
     def _session_cleanup_worker(self):
         """Background thread to clean up inactive sessions."""
@@ -877,7 +908,7 @@ class SessionManager:
             "is_processing": False,  # Processing flag
             "processing_thread": None,  # Background processing thread
             "chunks_per_second": 16000 / 512,  # Calculate chunks per second (31.25 chunks/sec for 32ms chunks)
-            "silent_chunks_threshold": int(2.0 * (16000 / 512)),  # 2 seconds of silence (62.5 chunks)
+            "silent_chunks_threshold": int(1.4 * (16000 / 512)),  # 1.4 seconds of silence (~43.8 chunks)
         }
         
         # Store session immediately so it's available for retrieval
@@ -885,43 +916,19 @@ class SessionManager:
         self.update_session_activity(session_id)
         logger.info(f"Session {session_id} stored in memory, starting initialization...")
         
-        # Initialize processors using preloaded models
+        # Initialize processors
         try:
             logger.info(f"Initializing ASR processor for session {session_id}")
-            # Use preloaded ASR model if available, otherwise create new one
-            if 'preloaded_asr_models' in globals() and model_request.asr_model in preloaded_asr_models:
-                session_data["asr_processor"] = preloaded_asr_models[model_request.asr_model]
-                logger.info(f"Using preloaded ASR model: {model_request.asr_model}")
-            else:
-                session_data["asr_processor"] = ASRProcessor(model_request.asr_model)
-                logger.info(f"Created new ASR processor for model: {model_request.asr_model}")
+            session_data["asr_processor"] = ASRProcessor()
             
             logger.info(f"Initializing VAD processor for session {session_id}")
-            # Use preloaded VAD processor if available, otherwise create new one
-            if 'preloaded_vad_processor' in globals() and preloaded_vad_processor is not None:
-                session_data["vad_processor"] = preloaded_vad_processor
-                logger.info("Using preloaded VAD processor")
-            else:
-                session_data["vad_processor"] = VADProcessor()
-                logger.info("Created new VAD processor")
+            session_data["vad_processor"] = VADProcessor()
             
             logger.info(f"Initializing LLM client for session {session_id}")
-            # Use preloaded LLM client if available, otherwise create new one
-            if 'preloaded_llm_client' in globals() and preloaded_llm_client is not None:
-                session_data["llm_client"] = preloaded_llm_client
-                logger.info("Using preloaded LLM client")
-            else:
-                session_data["llm_client"] = LiteLLMClient()
-                logger.info("Created new LLM client")
+            session_data["llm_client"] = LiteLLMClient()
             
             logger.info(f"Initializing TTS processor for session {session_id}")
-            # Use preloaded TTS processor if available, otherwise create new one
-            if 'preloaded_tts_processor' in globals() and preloaded_tts_processor is not None:
-                session_data["tts_processor"] = preloaded_tts_processor
-                logger.info("Using preloaded TTS processor")
-            else:
-                session_data["tts_processor"] = TTSProcessor()
-                logger.info("Created new TTS processor")
+            session_data["tts_processor"] = TTSProcessor()
             
             # Load resume content using the resume_url
             logger.info(f"Loading resume content for session {session_id}")
@@ -938,15 +945,10 @@ class SessionManager:
 
             # --- NEW: Generate opening question and TTS ---
             try:
-                model_info = {
-                    "provider": model_request.llm_provider,
-                    "model": model_request.llm_model
-                }
                 # Generate the first question
                 opening_question = generate_next_question(
                     session_data["llm_client"],
                     session_data["conversation_history"],
-                    model_info,
                     model_request.job_role,
                     session_data["resume_content"]
                 )
@@ -955,8 +957,7 @@ class SessionManager:
                     conversational_response = get_conversational_response(
                         session_data["llm_client"],
                         opening_question,
-                        session_data["conversation_history"],
-                        model_info
+                        session_data["conversation_history"]
                     )
                     if conversational_response:
                         session_data["conversation_history"].append({"role": "assistant", "content": conversational_response})
@@ -988,6 +989,121 @@ class SessionManager:
             if session_id in self.last_activity:
                 del self.last_activity[session_id]
             raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
+
+    def initialize_session(self, session_id: str, init_request: SessionInitializationRequest) -> Dict:
+        """Initialize an existing session with the provided database session ID."""
+        logger.info(f"Initializing existing session {session_id}")
+        
+        # Check if session already exists in memory
+        if session_id in self.sessions:
+            logger.warning(f"Session {session_id} already exists in memory, updating...")
+            existing_session = self.sessions[session_id]
+            # Update the existing session with new data
+            existing_session["model_request"] = init_request
+            existing_session["status"] = "active"
+            self.update_session_activity(session_id)
+            return existing_session
+        
+        # Create a ModelSelectionRequest from the initialization request
+        model_request = ModelSelectionRequest(
+            job_role=init_request.job_role,
+            user_id=init_request.user_id,
+            resume_url=init_request.resume_url
+        )
+        
+        # Initialize session data
+        session_data = {
+            "id": session_id,
+            "status": "initializing",  # Start with initializing status
+            "created_at": datetime.now(),
+            "model_request": model_request,
+            "conversation_history": [],
+            "audio_queue": queue.Queue(maxsize=1000),  # Audio buffer queue
+            "current_utterance": [],  # Current utterance buffer
+            "silence_chunks": 0,  # Silence counter
+            "is_processing": False,  # Processing flag
+            "processing_thread": None,  # Background processing thread
+            "chunks_per_second": 16000 / 512,  # Calculate chunks per second (31.25 chunks/sec for 32ms chunks)
+            "silent_chunks_threshold": int(1.4 * (16000 / 512)),  # 1.4 seconds of silence (~43.8 chunks)
+        }
+        
+        # Store session immediately so it's available for retrieval
+        self.sessions[session_id] = session_data
+        self.update_session_activity(session_id)
+        logger.info(f"Session {session_id} stored in memory, starting initialization...")
+        
+        # Initialize processors
+        try:
+            logger.info(f"Initializing ASR processor for session {session_id}")
+            session_data["asr_processor"] = ASRProcessor()
+            
+            logger.info(f"Initializing VAD processor for session {session_id}")
+            session_data["vad_processor"] = VADProcessor()
+            
+            logger.info(f"Initializing LLM client for session {session_id}")
+            session_data["llm_client"] = LiteLLMClient()
+            
+            logger.info(f"Initializing TTS processor for session {session_id}")
+            session_data["tts_processor"] = TTSProcessor()
+            
+            # Load resume content using the resume_url
+            logger.info(f"Loading resume content for session {session_id}")
+            session_data["resume_content"] = load_resume_from_supabase_path(model_request.resume_url)
+            
+            # Create initial conversation prompt
+            logger.info(f"Creating initial prompt for session {session_id}")
+            initial_prompt = self.create_initial_prompt(
+                model_request.job_role,
+                session_data["resume_content"]
+            )
+            session_data["conversation_history"] = [{"role": "system", "content": initial_prompt}, {"role": "user", "content": "Hello"}]
+
+            # --- NEW: Generate opening question and TTS ---
+            try:
+                # Generate the first question
+                opening_question = generate_next_question(
+                    session_data["llm_client"],
+                    session_data["conversation_history"],
+                    model_request.job_role,
+                    session_data["resume_content"]
+                )
+                if opening_question:
+                    # Get conversational response (natural phrasing)
+                    conversational_response = get_conversational_response(
+                        session_data["llm_client"],
+                        opening_question,
+                        session_data["conversation_history"]
+                    )
+                    if conversational_response:
+                        session_data["conversation_history"].append({"role": "assistant", "content": conversational_response})
+                        # Generate TTS
+                        audio_base64, _ = session_data["tts_processor"].synthesize(conversational_response)
+                        from pydantic import BaseModel
+                        class _TmpResponse(BaseModel):
+                            transcription: str
+                            response: str
+                            audio_response: str
+                        session_data["last_response"] = _TmpResponse(
+                            transcription="",  # No user speech yet
+                            response=conversational_response,
+                            audio_response=audio_base64 or ""
+                        )
+            except Exception as e:
+                logger.error(f"Failed to generate opening question: {e}")
+            
+            # Update session status to active after successful initialization
+            session_data["status"] = "active"
+            logger.info(f"Session {session_id} initialized successfully")
+            return session_data
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize session {session_id}: {e}")
+            # Clean up any partially created session
+            if session_id in self.sessions:
+                del self.sessions[session_id]
+            if session_id in self.last_activity:
+                del self.last_activity[session_id]
+            raise HTTPException(status_code=500, detail=f"Failed to initialize session: {str(e)}")
     
     def get_session(self, session_id: str) -> Dict:
         """Get session data."""
@@ -1024,7 +1140,7 @@ class SessionManager:
             logger.info(f"Session {session_id} deleted")
 
     def save_session_to_database(self, session_id: str, session_data: dict):
-        """Save session information to the interview_sessions table."""
+        """Update existing session information in the interview_sessions table."""
         if not SUPABASE_AVAILABLE or not supabase_config.client:
             logger.warning("Supabase not available, skipping session save")
             return
@@ -1100,53 +1216,49 @@ class SessionManager:
             else:
                 logger.info(f"No detection data found for session {session_id}")
             
+            # Determine ASR model used based on session data
+            asr_model_used = "gemini-2.5-flash"
+            
             # Prepare session information JSON (without resume_url and recording_url)
             session_information = {
                 "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
                 "conversation_history": conversation_history,
                 "anomalies_detected": anomalies_detected,
-                "asr_model": session_data.get("model_request").asr_model if session_data.get("model_request") else None,
-                "llm_provider": session_data.get("model_request").llm_provider if session_data.get("model_request") else None,
-                "llm_model": session_data.get("model_request").llm_model if session_data.get("model_request") else None
+                "asr_model": asr_model_used,  # Dynamic based on what was actually used
+                "llm_provider": "gemini",  # Fixed provider
+                "llm_model": "gemini-2.5-flash"  # Fixed model
             }
             
             # Convert datetime to ISO format string for JSON serialization
-            start_time = session_data.get("created_at")
-            if start_time and hasattr(start_time, 'isoformat'):
-                start_time = start_time.isoformat()
+            end_time = datetime.now(timezone.utc)
+            if hasattr(end_time, 'isoformat'):
+                end_time = end_time.isoformat()
             
-            # Prepare data for interview_sessions table
-            # Note: session_id is the primary key, so we don't include it in the data
-            # The database will generate a new UUID for the primary key
-            session_record = {
-                "interviewee_id": session_data.get("model_request").user_id if session_data.get("model_request") else None,  # User ID from session creation
-                "template_id": None,  # Could be extracted from job_role if needed
-                "start_time": start_time,  # Use created_at as start_time (converted to ISO string)
+            # Update the existing session in the database
+            update_data = {
+                "end_time": end_time,
                 "status": "completed",
                 "session_information": session_information,
-                "resume_url": session_data.get("model_request").resume_url if session_data.get("model_request") else None,  # Separate column
-                "recording_url": recording_url  # Separate column
+                "recording_url": recording_url
             }
             
-            # Save to database
-            saved_session_id = supabase_config.save_interview_session(session_record)
-            if saved_session_id:
-                # Store the mapping between original session ID and database session ID
-                if not hasattr(self, 'session_id_mapping'):
-                    self.session_id_mapping = {}
-                self.session_id_mapping[session_id] = saved_session_id
-                
-                logger.info(f"Session {session_id} information saved to database with ID: {saved_session_id}")
-                logger.info(f"  - Start time: {session_record['start_time']}")
-                logger.info(f"  - Resume URL: {session_record['resume_url']}")
-                logger.info(f"  - Recording URL: {session_record['recording_url']}")
+            # Update the session in the database
+            update_success = supabase_config.update_session_complete(session_id, update_data)
+            if update_success:
+                logger.info(f"Session {session_id} information updated in database successfully")
+                logger.info(f"  - End time: {update_data['end_time']}")
+                logger.info(f"  - Recording URL: {update_data['recording_url']}")
                 logger.info(f"  - Conversation messages: {len(conversation_history)}")
                 logger.info(f"  - Anomalies detected: {len(anomalies_detected)}")
+                # Trigger post-processing scripts once per session
+                if session_id not in self.postprocess_started:
+                    self.postprocess_started.add(session_id)
+                    self.start_post_session_jobs(session_id)
             else:
-                logger.error(f"Failed to save session {session_id} information to database")
+                logger.error(f"Failed to update session {session_id} information in database")
                 
         except Exception as e:
-            logger.error(f"Error saving session {session_id} to database: {e}")
+            logger.error(f"Error updating session {session_id} in database: {e}")
             raise
     
     def load_resume_content(self, resume_file: str) -> str:
@@ -1338,15 +1450,25 @@ class VADProcessor:
         if not load_silero_vad:
             logger.warning("Silero VAD not installed. Using fallback VAD.")
             return
-            
-        try:
-            # Use the imported load_silero_vad function instead of torch.hub.load directly
-            self.model = load_silero_vad()
-            logger.info("VAD model loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load VAD model: {e}")
-            logger.warning("Using fallback VAD without Silero model")
-            self.model = None
+        
+        # Try to use cached model first
+        if model_cache.get("vad_processor"):
+            self.model = model_cache["vad_processor"]
+            logger.info("Using cached VAD model")
+        else:
+            # Fallback to loading model if not cached
+            try:
+                logger.info("Loading VAD model (not cached)")
+                # Use the imported load_silero_vad function instead of torch.hub.load directly
+                self.model = load_silero_vad()
+                logger.info("VAD model loaded successfully")
+                
+                # Cache the model for future use
+                model_cache["vad_processor"] = self.model
+            except Exception as e:
+                logger.error(f"Failed to load VAD model: {e}")
+                logger.warning("Using fallback VAD without Silero model")
+                self.model = None
 
     def detect_speech_in_chunk(self, audio_chunk_float, sample_rate=16000):
         """Detect speech in a single audio chunk."""
@@ -1461,95 +1583,191 @@ class VADProcessor:
             return 0.0
 
 class ASRProcessor:
-    def __init__(self, model_name="openai/whisper-medium"):  # Updated default
-        logger.info(f"Initializing ASR Processor with model: {model_name}")
-        self.model_name = model_name
+    def __init__(self):
+        logger.info("Initializing ASR Processor (Gemini only)")
+        
+        # Initialize Gemini ASR client
+        self.gemini_client = None
+        self.gemini_api_key = None
+        if not GEMINI_ASR_AVAILABLE:
+            raise RuntimeError("Gemini ASR is not available")
         try:
-            self.processor = WhisperProcessor.from_pretrained(model_name)
-            self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.model.to(self.device)
-            logger.info(f"ASR model loaded successfully on {self.device}")
+            try:
+                from config import get_gemini_api_key
+                self.gemini_api_key = get_gemini_api_key()
+            except ImportError:
+                self.gemini_api_key = os.environ.get('GEMINI_API_KEY')
+            
+            if not self.gemini_api_key:
+                raise RuntimeError("GEMINI_API_KEY not available for ASR")
+            
+            self.gemini_client = genai.Client(api_key=self.gemini_api_key)
+            logger.info("Gemini ASR client initialized successfully")
         except Exception as e:
-            logger.error(f"Failed to load ASR model: {e}")
+            logger.error(f"Failed to initialize Gemini ASR client: {e}")
             raise
+        
+        # Primary method is always Gemini
+        self.primary_method = "gemini"
+        logger.info("Using Gemini ASR as the only ASR method")
 
     def preprocess_audio(self, audio_array, sample_rate=16000):
-        """Preprocess audio for better ASR performance."""
-        if signal is None:
-            return audio_array
-        
+        """Preprocess audio for better ASR performance.
+        Steps:
+        - DC offset removal
+        - Pre-emphasis
+        - Band-pass filtering
+        - Optional Wiener denoising (fast) if SciPy available
+        - Automatic gain control (target RMS)
+        - Soft noise gate (avoid hard zeroing)
+        - Safe normalization with limiter
+        """
         try:
-            # Remove DC offset
-            audio_array = audio_array - np.mean(audio_array)
-            
-            # Apply pre-emphasis filter to boost high frequencies
+            # Ensure float32 for stable processing
+            audio = np.asarray(audio_array, dtype=np.float32)
+            if audio.size == 0:
+                return audio
+
+            # 1) DC offset removal
+            audio = audio - float(np.mean(audio))
+
+            # 2) Pre-emphasis to boost higher frequencies slightly
             pre_emphasis = 0.97
-            emphasized_audio = np.append(audio_array[0], audio_array[1:] - pre_emphasis * audio_array[:-1])
-            
-            # Apply high-pass filter to remove low-frequency noise (50-300 Hz)
-            nyquist = sample_rate / 2
-            low_cutoff = 50  # Hz
-            high_cutoff = 8000  # Hz
-            b, a = signal.butter(4, [low_cutoff / nyquist, high_cutoff / nyquist], btype='band')
-            filtered_audio = signal.filtfilt(b, a, emphasized_audio)
-            
-            # Normalize audio to prevent clipping
-            max_val = np.max(np.abs(filtered_audio))
-            if max_val > 0:
-                normalized_audio = filtered_audio / max_val * 0.95  # Leave some headroom
-            
-            # Apply noise reduction using spectral subtraction (simple approach)
-            # Calculate noise floor from first 100ms
-            noise_samples = min(int(0.1 * sample_rate), len(normalized_audio))
-            noise_floor = np.mean(np.abs(normalized_audio[:noise_samples]))
-            
-            # Apply noise gate
-            noise_threshold = noise_floor * 3
-            normalized_audio[np.abs(normalized_audio) < noise_threshold] = 0
-            
-            return normalized_audio
+            audio = np.append(audio[0], audio[1:] - pre_emphasis * audio[:-1]).astype(np.float32)
+
+            # 3) Band-pass filter to keep speech band
+            if signal is not None:
+                nyquist = sample_rate / 2.0
+                low_cutoff = 60.0  # Hz
+                high_cutoff = min(7600.0, nyquist - 200.0)  # Keep margin
+                low = low_cutoff / nyquist
+                high = high_cutoff / nyquist
+                b, a = signal.butter(4, [low, high], btype='band')
+                audio = signal.filtfilt(b, a, audio).astype(np.float32)
+
+                # 4) Light denoising using Wiener filter (fast 1D)
+                # Use a small window to avoid over-smoothing speech
+                try:
+                    audio = signal.wiener(audio, mysize=31).astype(np.float32)
+                except Exception:
+                    # If Wiener fails for any reason, continue without it
+                    pass
+
+            # 5) Automatic Gain Control (AGC)
+            # Target RMS around -20 dBFS (~0.1 in linear)
+            eps = 1e-8
+            rms = float(np.sqrt(np.mean(audio**2)) + eps)
+            target_rms = 0.1
+            gain = target_rms / rms
+            # Clamp extreme gains to avoid artifacts
+            gain = float(np.clip(gain, 0.5, 10.0))
+            audio = (audio * gain).astype(np.float32)
+
+            # 6) Soft noise gate based on short noise estimation (~120 ms)
+            noise_samples = min(int(0.12 * sample_rate), audio.size)
+            if noise_samples > 0:
+                noise_floor = float(np.median(np.abs(audio[:noise_samples])))
+                threshold = noise_floor * 2.0
+                # Apply soft attenuation (not hard zero) below threshold
+                # This preserves natural ambience while reducing hiss
+                attenuation = 0.35
+                mask = np.abs(audio) < threshold
+                audio[mask] = (audio[mask] * attenuation).astype(np.float32)
+
+            # 7) Safe peak normalization with limiter
+            peak = float(np.max(np.abs(audio)) + eps)
+            if peak > 0.99:
+                audio = (audio / peak * 0.98).astype(np.float32)
+
+            # 8) Final clamp to avoid any residual overs
+            audio = np.clip(audio, -0.99, 0.99, dtype=np.float32)
+
+            return audio
         except Exception as e:
             logger.error(f"Audio preprocessing error: {e}")
             return audio_array
 
     def transcribe(self, audio_array, sample_rate=16000):
-        """Transcribe audio to text."""
+        """Transcribe audio to text using Gemini API."""
         if len(audio_array) == 0:
             return ""
         
         start_time = time.time()
+        
+        # Gemini-only transcription
         try:
-            # Preprocess audio
-            processed_audio = self.preprocess_audio(audio_array, sample_rate)
-            
-            # Transcribe
-            inputs = self.processor(processed_audio, sampling_rate=sample_rate, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                predicted_ids = self.model.generate(inputs.input_features)
-            transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True, normalize=True)
-            result = transcription[0].strip() if transcription else ""
-            
-            logger.info(f"ASR transcription completed in {time.time() - start_time:.3f}s: '{result}'")
-            return result
-        except Exception as e:
-            logger.error(f"ASR error: {e}")
+            result = self._transcribe_with_gemini(audio_array, sample_rate)
+            if result:
+                logger.info(f"Gemini ASR transcription completed in {time.time() - start_time:.3f}s: '{result}'")
+                return result
+            logger.warning("Gemini ASR returned empty result")
             return ""
+        except Exception as e:
+            logger.error(f"Gemini ASR error: {e}")
+            return ""
+    
+    def _transcribe_with_gemini(self, audio_array, sample_rate=16000):
+        """Transcribe audio using Gemini API."""
+        try:
+            # Convert audio array to WAV format bytes
+            import wave
+            import io
+            
+            # Convert to 16-bit PCM
+            audio_int16 = (audio_array * 32767).astype(np.int16)
+            
+            # Create WAV file in memory
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sample_rate)  # Sample rate
+                wav_file.writeframes(audio_int16.tobytes())
+            
+            # Get WAV data
+            wav_data = wav_buffer.getvalue()
+            if not os.path.exists("sessions/session_audio_debug"):
+                os.mkdir("sessions/session_audio_debug")
+            with open(f"sessions/session_audio_debug/{time.time()}.wav", "wb") as f:
+                f.write(wav_data)
+            
+            # Send request to Gemini
+            response = self.gemini_client.models.generate_content(
+                model='gemini-2.5-pro',
+                contents=[
+                    'Transcribe this audio clip. Do not add any other information to the response. Just transcribe the audio. The audio is in English. Do not transcribe anything in the audio that is not in English.',
+                    types.Part.from_bytes(
+                        data=wav_data,
+                        mime_type='audio/wav',
+                    )
+                ]
+            )
+            
+            # Extract transcription
+            transcription = response.text.strip() if response.text else ""
+            return transcription
+            
+        except Exception as e:
+            logger.error(f"Gemini ASR transcription error: {e}")
+            raise
+    
+    
 
 class LiteLLMClient:
-    def __init__(self, base_url="http://localhost:11434"):
-        self.api_base = base_url
-        logger.info(f"Initializing LiteLLM client with base URL: {base_url}")
+    def __init__(self):
+        logger.info("Initializing LiteLLM client")
+        # Use fixed model settings - no user-provided options
+        self.provider = "gemini"
+        self.model = "gemini-2.5-flash-lite"
+        self.api_base = "http://localhost:11434"  # Not used for Gemini
 
-    def chat(self, messages, model_info, prompt_type="chat"):
+    def chat(self, messages, prompt_type="chat"):
         if litellm is None:
             logger.error("LiteLLM package not available.")
             return "Sorry, the language model backend is not available."
         
         start_time = time.time()
-        provider = model_info.get("provider", "ollama")
-        model = model_info.get("model", "llama3.2:1b")
-        model_string = f"{provider}/{model}"
+        model_string = f"{self.provider}/{self.model}"
 
         kwargs = {
             "model": model_string,
@@ -1557,9 +1775,9 @@ class LiteLLMClient:
             "stream": False
         }
 
-        if provider == "ollama":
+        if self.provider == "ollama":
             kwargs["api_base"] = self.api_base
-        elif provider == "gemini":
+        elif self.provider == "gemini":
             # Get Gemini API key from configuration
             try:
                 from config import get_gemini_api_key
@@ -1592,12 +1810,23 @@ class TTSProcessor:
         if not KPipeline:
             raise ImportError("Kokoro TTS not installed.")
         logger.info("Initializing TTS Processor")
-        try:
-            self.pipeline = KPipeline(lang_code='a')
-            logger.info("TTS pipeline initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize TTS pipeline: {e}")
-            raise
+        
+        # Try to use cached pipeline first
+        if model_cache.get("tts_processor"):
+            self.pipeline = model_cache["tts_processor"]
+            logger.info("Using cached TTS pipeline")
+        else:
+            # Fallback to loading pipeline if not cached
+            try:
+                logger.info("Loading TTS pipeline (not cached)")
+                self.pipeline = KPipeline(lang_code='a')
+                logger.info("TTS pipeline initialized successfully")
+                
+                # Cache the pipeline for future use
+                model_cache["tts_processor"] = self.pipeline
+            except Exception as e:
+                logger.error(f"Failed to initialize TTS pipeline: {e}")
+                raise
 
     def synthesize(self, text, voice="af_heart"):
         if not text:
@@ -1656,15 +1885,9 @@ def process_utterance(session_id: str, audio_data: np.ndarray) -> InterviewRespo
         session["conversation_history"].append({"role": "user", "content": transcription})
         
         # Generate next question
-        model_info = {
-            "provider": session["model_request"].llm_provider,
-            "model": session["model_request"].llm_model
-        }
-        
         next_question = generate_next_question(
             session["llm_client"], 
             session["conversation_history"], 
-            model_info,
             session["model_request"].job_role,
             session["resume_content"]
         )
@@ -1674,8 +1897,7 @@ def process_utterance(session_id: str, audio_data: np.ndarray) -> InterviewRespo
             conversational_response = get_conversational_response(
                 session["llm_client"], 
                 next_question, 
-                session["conversation_history"], 
-                model_info
+                session["conversation_history"]
             )
             
             if conversational_response:
@@ -1696,7 +1918,7 @@ def process_utterance(session_id: str, audio_data: np.ndarray) -> InterviewRespo
         logger.error(f"Error processing utterance for session {session_id}: {e}")
         return InterviewResponse(transcription="", response="", audio_response=None)
 
-def generate_next_question(llm_client, conversation_history, model_info, interview_topic, resume_content):
+def generate_next_question(llm_client, conversation_history, interview_topic, resume_content):
     """Generate the next interview question."""
     logger.info("Generating next question")
     qgen_prompt = f"""You are a question generation module. Your task is to generate the next interview question based on the conversation history, the interview topic, and the candidate's resume. The question should be a logical follow-up to the previous turn in the conversation. Do not ask more than one question. Do not ask for clarification. Just generate the question.
@@ -1710,14 +1932,14 @@ The topic for today's interview is: {interview_topic}
 
 Based on the conversation history, generate the next question."""
     messages = conversation_history + [{"role": "system", "content": qgen_prompt}]
-    return llm_client.chat(messages, model_info, prompt_type="qgen")
+    return llm_client.chat(messages, prompt_type="qgen")
 
-def get_conversational_response(llm_client, question, conversation_history, model_info):
+def get_conversational_response(llm_client, question, conversation_history):
     """Get a conversational response from the LLM."""
     logger.info("Getting conversational response")
     conversational_prompt = f"You are Serin, an interviewer. Your goal is to ask the following question in a natural and conversational way: '{question}'. Do not add any other information to the response. Just ask the question."
     messages = conversation_history + [{"role": "system", "content": conversational_prompt}]
-    return llm_client.chat(messages, model_info, prompt_type="chat")
+    return llm_client.chat(messages, prompt_type="chat")
 
 def continuous_audio_processor(session_id: str):
     """Background thread for continuous audio processing."""
@@ -1816,7 +2038,31 @@ async def upload_recording(
         # Save recording (will try Supabase first, fallback to local)
         recording_info = session_manager.save_recording(session_id, recording_data, filename)
         
-        # Try to update existing session in database with recording URL
+        # Fallback: Complete session if not already completed (in case WebSocket disconnected unexpectedly)
+        try:
+            if session_id in session_manager.sessions:
+                session_data = session_manager.sessions[session_id]
+                if session_data.get("status") != "completed":
+                    logger.info(f"Fallback: Completing session {session_id} during recording upload (WebSocket may have disconnected)")
+                    session_manager.save_session_to_database(session_id, session_data)
+                    session_data["status"] = "completed"
+                    logger.info(f"Fallback: Session {session_id} completed successfully during recording upload")
+                else:
+                    logger.info(f"Session {session_id} already completed, skipping fallback completion")
+            else:
+                logger.warning(f"Session {session_id} not found in memory during recording upload")
+        except Exception as e:
+            logger.error(f"Fallback: Failed to complete session {session_id} during recording upload: {e}")
+        
+        # Only update recording URL, don't complete session here
+        # Session completion should happen when interview ends, not when recording is uploaded
+        try:
+            logger.info(f"Updating recording URL for session {session_id}")
+            # The recording URL will be updated by the existing fallback logic below
+        except Exception as e:
+            logger.error(f"Failed to update recording URL for session {session_id}: {e}")
+        
+        # Try to update existing session in database with recording URL (legacy fallback)
         if recording_info.public_url:
             try:
                 # Check if session exists in database and update with recording URL
@@ -2155,10 +2401,21 @@ async def create_session(model_request: ModelSelectionRequest):
     try:
         logger.info(f"Creating session {session_id} with job_role: {model_request.job_role}")
         
+        # Check if models are ready
+        models_ready = {
+            "asr_ready": is_asr_ready(),
+            "tts_processor": model_cache.get("tts_processor") is not None,
+            "vad_processor": model_cache.get("vad_processor") is not None
+        }
+        
+        if not all(models_ready.values()):
+            logger.error(f"Models not ready for session {session_id}: {models_ready}")
+            raise HTTPException(status_code=503, detail="Models not ready. Please wait for startup to complete.")
+        
         # Create session with timeout protection
         session_data = await asyncio.wait_for(
             asyncio.to_thread(session_manager.create_session, session_id, model_request),
-            timeout=30.0  # 30 second timeout for session creation
+            timeout=30.0  # Reduced timeout since models are preloaded
         )
         
         # Start background processing thread
@@ -2178,13 +2435,63 @@ async def create_session(model_request: ModelSelectionRequest):
         # Clean up any partial session
         if session_id in session_manager.sessions:
             session_manager.delete_session(session_id)
-        raise HTTPException(status_code=504, detail="Session creation timeout - server is busy")
+        raise HTTPException(status_code=504, detail="Session creation timeout. All models are preloaded at startup, this should not happen.")
     except Exception as e:
         logger.error(f"Failed to create session {session_id}: {e}")
         # Clean up any partial session
         if session_id in session_manager.sessions:
             session_manager.delete_session(session_id)
         raise HTTPException(status_code=500, detail=f"Failed to create session: {str(e)}")
+
+@app.post("/sessions/initialize")
+async def initialize_session(init_request: SessionInitializationRequest):
+    """Initialize an existing session with the provided database session ID."""
+    session_id = init_request.session_id
+    
+    try:
+        logger.info(f"Initializing session {session_id} with job_role: {init_request.job_role}")
+        
+        # Check if models are ready
+        models_ready = {
+            "asr_ready": is_asr_ready(),
+            "tts_processor": model_cache.get("tts_processor") is not None,
+            "vad_processor": model_cache.get("vad_processor") is not None
+        }
+        
+        if not all(models_ready.values()):
+            logger.error(f"Models not ready for session {session_id}: {models_ready}")
+            raise HTTPException(status_code=503, detail="Models not ready. Please wait for startup to complete.")
+        
+        # Initialize session with timeout protection
+        session_data = await asyncio.wait_for(
+            asyncio.to_thread(session_manager.initialize_session, session_id, init_request),
+            timeout=30.0  # Reduced timeout since models are preloaded
+        )
+        
+        # Start background processing thread
+        processing_thread = threading.Thread(
+            target=continuous_audio_processor,
+            args=(session_id,),
+            daemon=True
+        )
+        processing_thread.start()
+        session_data["processing_thread"] = processing_thread
+        
+        logger.info(f"Initialized session {session_id} successfully")
+        return {"session_id": session_id, "status": "initialized"}
+        
+    except asyncio.TimeoutError:
+        logger.error(f"Session initialization timeout for {session_id}")
+        # Clean up any partial session
+        if session_id in session_manager.sessions:
+            session_manager.delete_session(session_id)
+        raise HTTPException(status_code=504, detail="Session initialization timeout. All models are preloaded at startup, this should not happen.")
+    except Exception as e:
+        logger.error(f"Failed to initialize session {session_id}: {e}")
+        # Clean up any partial session
+        if session_id in session_manager.sessions:
+            session_manager.delete_session(session_id)
+        raise HTTPException(status_code=500, detail=f"Failed to initialize session: {str(e)}")
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
@@ -2340,6 +2647,43 @@ async def end_session(session_id: str):
         logger.error(f"Failed to end session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/sessions/{session_id}/complete")
+async def complete_session(session_id: str):
+    """Complete a session by saving all information to database without deleting from memory."""
+    try:
+        logger.info(f"Session completion requested for session {session_id}")
+        
+        if session_id not in session_manager.sessions:
+            logger.error(f"Session {session_id} not found in memory")
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        logger.info(f"Session {session_id} found in memory, proceeding with completion")
+        
+        # Save complete session information to database
+        session_data = session_manager.sessions[session_id]
+        logger.info(f"Saving session {session_id} to database with conversation history length: {len(session_data.get('conversation_history', []))}")
+        
+        session_manager.save_session_to_database(session_id, session_data)
+        logger.info(f"Session {session_id} saved to database successfully")
+        
+        # Update session status to completed
+        session_data["status"] = "completed"
+        logger.info(f"Session {session_id} status updated to completed")
+        
+        return {
+            "status": "completed",
+            "session_id": session_id,
+            "message": "Session completed and information saved to database"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to complete session {session_id}: {e}")
+        import traceback
+        logger.error(f"Session completion error details: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/sessions/{session_id}/info")
 async def get_session_information(session_id: str):
     """Get session information that would be saved to database."""
@@ -2400,14 +2744,17 @@ async def get_session_information(session_id: str):
                         "description": f"Digital devices detected in frame: {device_count} devices"
                     })
         
+        # Determine ASR model used based on session data
+        asr_model_used = "gemini-2.5-flash"
+        
         # Prepare session information (without date_of_interview, resume_url, recording_url)
         session_information = {
             "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
             "conversation_history": conversation_history,
             "anomalies_detected": anomalies_detected,
-            "asr_model": session_data.get("model_request").asr_model if session_data.get("model_request") else None,
-            "llm_provider": session_data.get("model_request").llm_provider if session_data.get("model_request") else None,
-            "llm_model": session_data.get("model_request").llm_model if session_data.get("model_request") else None
+            "asr_model": asr_model_used,  # Dynamic based on what was actually used
+            "llm_provider": "gemini",  # Fixed provider
+            "llm_model": "gemini-2.5-flash"  # Fixed model
         }
         
         return {
@@ -2502,62 +2849,17 @@ async def get_user_resumes(user_id: str):
 @app.get("/models")
 async def get_available_models():
     """Get available ASR and LLM models."""
-    from model_selector import get_available_asr_models, get_available_llm_models
+    # Determine available ASR models based on what's loaded
+    asr_models = []
+    if GEMINI_ASR_AVAILABLE:
+        asr_models.append("gemini-2.5-flash")
     
     return {
-        "asr_models": get_available_asr_models(),
-        "llm_models": get_available_llm_models()
+        "asr_models": asr_models,
+        "llm_models": ["gemini-2.5-flash"],  # Fixed model used by the system
+        "primary_asr": "gemini-2.5-flash" if GEMINI_ASR_AVAILABLE else None,
+        "note": "System uses Gemini ASR only. User model selection is not supported."
     }
-
-@app.get("/models/preloaded")
-async def get_preloaded_models():
-    """Get detailed information about preloaded models."""
-    preloaded_info = {
-        "asr_models": {},
-        "vad_processor": None,
-        "tts_processor": None,
-        "llm_client": None,
-        "video_processor": None
-    }
-    
-    # ASR models info
-    if 'preloaded_asr_models' in globals():
-        for model_name, processor in preloaded_asr_models.items():
-            preloaded_info["asr_models"][model_name] = {
-                "loaded": True,
-                "device": processor.device if hasattr(processor, 'device') else "unknown",
-                "model_name": processor.model_name if hasattr(processor, 'model_name') else model_name
-            }
-    
-    # VAD processor info
-    if 'preloaded_vad_processor' in globals() and preloaded_vad_processor is not None:
-        preloaded_info["vad_processor"] = {
-            "loaded": True,
-            "model_available": preloaded_vad_processor.model is not None
-        }
-    
-    # TTS processor info
-    if 'preloaded_tts_processor' in globals() and preloaded_tts_processor is not None:
-        preloaded_info["tts_processor"] = {
-            "loaded": True,
-            "pipeline_available": hasattr(preloaded_tts_processor, 'pipeline')
-        }
-    
-    # LLM client info
-    if 'preloaded_llm_client' in globals() and preloaded_llm_client is not None:
-        preloaded_info["llm_client"] = {
-            "loaded": True,
-            "api_base": preloaded_llm_client.api_base if hasattr(preloaded_llm_client, 'api_base') else "unknown"
-        }
-    
-    # Video processor info
-    if 'preloaded_video_processor' in globals() and preloaded_video_processor is not None:
-        preloaded_info["video_processor"] = {
-            "loaded": True,
-            "model_available": hasattr(preloaded_video_processor, 'model')
-        }
-    
-    return preloaded_info
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
@@ -2645,6 +2947,33 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             
             except Exception as e:
                 logger.error(f"Error in WebSocket message loop for session {session_id}: {e}")
+                # Check if this is a WebSocket disconnection error
+                if "1005" in str(e) or "1001" in str(e) or "1000" in str(e):
+                    logger.info(f"WebSocket disconnection detected for session {session_id}, triggering auto-save")
+                    # Trigger auto-save for WebSocket disconnection
+                    try:
+                        if session_id in session_manager.sessions:
+                            session_data = session_manager.sessions[session_id]
+                            
+                            # Only save if session is not already completed
+                            if session_data.get("status") != "completed":
+                                logger.info(f"Auto-saving session {session_id} due to WebSocket disconnection")
+                                
+                                # Update session status to completed
+                                session_data["status"] = "completed"
+                                
+                                # Save complete session information to database
+                                session_manager.save_session_to_database(session_id, session_data)
+                                logger.info(f"Session {session_id} auto-saved successfully with complete information")
+                            else:
+                                logger.info(f"Session {session_id} already completed, skipping auto-save")
+                        else:
+                            logger.warning(f"Session {session_id} not found in memory during WebSocket disconnection")
+                    except Exception as save_error:
+                        logger.error(f"Failed to auto-save session {session_id} on WebSocket disconnection: {save_error}")
+                        import traceback
+                        logger.error(f"Auto-save error details: {traceback.format_exc()}")
+                
                 # Try to send error message
                 try:
                     await websocket.send_text(json.dumps({"error": "Internal server error"}))
@@ -2657,12 +2986,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Auto-save session when WebSocket disconnects
         try:
             if session_id in session_manager.sessions:
-                logger.info(f"Auto-saving session {session_id} due to WebSocket disconnect")
                 session_data = session_manager.sessions[session_id]
-                session_manager.save_session_to_database(session_id, session_data)
-                logger.info(f"Session {session_id} auto-saved successfully")
+                
+                # Only save if session is not already completed
+                if session_data.get("status") != "completed":
+                    logger.info(f"Auto-saving session {session_id} due to WebSocket disconnect")
+                    
+                    # Update session status to completed
+                    session_data["status"] = "completed"
+                    
+                    # Save complete session information to database
+                    session_manager.save_session_to_database(session_id, session_data)
+                    logger.info(f"Session {session_id} auto-saved successfully with complete information")
+                else:
+                    logger.info(f"Session {session_id} already completed, skipping auto-save")
+            else:
+                logger.warning(f"Session {session_id} not found in memory during WebSocket disconnect")
         except Exception as e:
             logger.error(f"Failed to auto-save session {session_id} on disconnect: {e}")
+            import traceback
+            logger.error(f"Auto-save error details: {traceback.format_exc()}")
     except Exception as e:
         logger.error(f"WebSocket error for session {session_id}: {e}")
         try:
@@ -2672,12 +3015,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Auto-save session on any WebSocket error
         try:
             if session_id in session_manager.sessions:
-                logger.info(f"Auto-saving session {session_id} due to WebSocket error")
                 session_data = session_manager.sessions[session_id]
-                session_manager.save_session_to_database(session_id, session_data)
-                logger.info(f"Session {session_id} auto-saved successfully after error")
+                
+                # Only save if session is not already completed
+                if session_data.get("status") != "completed":
+                    logger.info(f"Auto-saving session {session_id} due to WebSocket error")
+                    
+                    # Update session status to completed
+                    session_data["status"] = "completed"
+                    
+                    # Save complete session information to database
+                    session_manager.save_session_to_database(session_id, session_data)
+                    logger.info(f"Session {session_id} auto-saved successfully after error")
+                else:
+                    logger.info(f"Session {session_id} already completed, skipping auto-save after error")
+            else:
+                logger.warning(f"Session {session_id} not found in memory during WebSocket error")
         except Exception as save_error:
             logger.error(f"Failed to auto-save session {session_id} after error: {save_error}")
+            import traceback
+            logger.error(f"Auto-save error details: {traceback.format_exc()}")
 
 if __name__ == "__main__":
     import uvicorn

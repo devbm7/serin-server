@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  interview-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - FASTAPI_HOST=0.0.0.0
+      - PORT=8000
+      - FASTAPI_RELOAD=false
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+    volumes:
+      - ./recordings:/app/recordings
+      - ./sessions:/app/sessions
+      - model_cache:/root/.cache/huggingface
+      - ./whisper-medium:/app/whisper-medium
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+
+volumes:
+  model_cache:
+    driver: local

@@ -290,37 +290,89 @@ class SupabaseConfig:
             return False
         
         try:
-            # First, let's try to find the session by looking for sessions created recently
-            # and checking if they match our session pattern
-            from datetime import datetime, timedelta
+            logger.info(f"Attempting to update session {original_session_id} with recording URL: {recording_url}")
             
-            # Get sessions created in the last hour
-            one_hour_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+            # Since the frontend creates the session entry first, we should be able to find it directly
+            # by the session_id (which is the primary key)
+            response = self.client.table("interview_sessions").select("session_id, recording_url").eq("session_id", original_session_id).execute()
             
-            response = self.client.table("interview_sessions").select("session_id, start_time, recording_url").gte("start_time", one_hour_ago).execute()
+            logger.info(f"Direct session lookup result: {len(response.data) if response.data else 0} sessions found")
             
-            if response.data:
-                # Find the most recent session that doesn't have a recording URL
-                for session in response.data:
-                    if not session.get("recording_url"):
-                        # This is likely our session - update it
-                        db_session_id = session.get("session_id")
-                        update_response = self.client.table("interview_sessions").update({
-                            "recording_url": recording_url
-                        }).eq("session_id", db_session_id).execute()
-                        
-                        if update_response.data and len(update_response.data) > 0:
-                            logger.info(f"Updated session {db_session_id} with recording URL: {recording_url}")
-                            return True
+            if response.data and len(response.data) > 0:
+                # Session found, update it with the recording URL
+                logger.info(f"Session {original_session_id} found, updating with recording URL")
+                update_response = self.client.table("interview_sessions").update({
+                    "recording_url": recording_url
+                }).eq("session_id", original_session_id).execute()
                 
-                logger.warning(f"No session found to update with recording URL for original ID: {original_session_id}")
-                return False
+                if update_response.data and len(update_response.data) > 0:
+                    logger.info(f"Updated session {original_session_id} with recording URL: {recording_url}")
+                    return True
+                else:
+                    logger.warning(f"Failed to update session {original_session_id} with recording URL")
+                    return False
             else:
-                logger.warning(f"No recent sessions found in database")
-                return False
+                # Session not found, try the old method as fallback
+                logger.warning(f"Session {original_session_id} not found directly, trying fallback method")
+                
+                # Get sessions created in the last hour as fallback
+                from datetime import datetime, timedelta
+                one_hour_ago = (datetime.now() - timedelta(hours=1)).isoformat()
+                
+                logger.info(f"Searching for sessions created after: {one_hour_ago}")
+                
+                response = self.client.table("interview_sessions").select("session_id, start_time, recording_url").gte("start_time", one_hour_ago).execute()
+                
+                logger.info(f"Fallback session lookup result: {len(response.data) if response.data else 0} sessions found")
+                
+                if response.data:
+                    # Log all found sessions for debugging
+                    for session in response.data:
+                        logger.info(f"Found session: {session.get('session_id')}, start_time: {session.get('start_time')}, has_recording: {bool(session.get('recording_url'))}")
+                    
+                    # Find the most recent session that doesn't have a recording URL
+                    for session in response.data:
+                        if not session.get("recording_url"):
+                            # This is likely our session - update it
+                            db_session_id = session.get("session_id")
+                            logger.info(f"Updating session {db_session_id} with recording URL (fallback)")
+                            update_response = self.client.table("interview_sessions").update({
+                                "recording_url": recording_url
+                            }).eq("session_id", db_session_id).execute()
+                            
+                            if update_response.data and len(update_response.data) > 0:
+                                logger.info(f"Updated session {db_session_id} with recording URL (fallback): {recording_url}")
+                                return True
+                    
+                    logger.warning(f"No session found to update with recording URL for original ID: {original_session_id}")
+                    return False
+                else:
+                    logger.warning(f"No recent sessions found in database")
+                    return False
                 
         except Exception as e:
             logger.error(f"Failed to update session by original ID {original_session_id}: {e}")
+            return False
+
+    def update_session_complete(self, session_id: str, update_data: dict) -> bool:
+        """Update an existing session with completion data (end_time, status, session_information, recording_url)."""
+        if not self.client:
+            logger.error("Supabase client not initialized")
+            return False
+        
+        try:
+            # Update the session with completion data
+            response = self.client.table("interview_sessions").update(update_data).eq("session_id", session_id).execute()
+            
+            if response.data and len(response.data) > 0:
+                logger.info(f"Updated session {session_id} with completion data successfully")
+                return True
+            else:
+                logger.warning(f"No session found to update with completion data: {session_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Failed to update session {session_id} with completion data: {e}")
             return False
 
 # Global Supabase configuration instance

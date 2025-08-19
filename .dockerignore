@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.local
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+
+# Local data and logs
+recordings/
+sessions/
+*.log
+*.csv
+*.pdf
+*.dat
+*.pth
+*.html
+
+# Test files
+test_*.py

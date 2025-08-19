@@ -24,6 +24,9 @@ torchaudio
 litellm
 requests
 
+# Google GenAI for ASR
+google-genai>=0.3.0
+
 
 # VAD
 silero-vad
@@ -44,3 +47,6 @@ rich
 
 # Supabase
 supabase
+
+# PDF
+reportlab
