@@ -857,10 +857,10 @@ class SessionManager:
             eval_script_path = Path("eval_module.py")
             pdf_script_path = Path("json_to_pdf.py")
             if EVALUATION_MODULE_AVAILABLE:
-                self._run_script_background(eval_script_path, session_id, "eval_module")
-                # eval_script = InterviewEvaluationModuleGemini()
-                # result = eval_script.evaluate_interview_session(session_id)
-                # logger.info(f"Evaluation result: {result}")
+                # self._run_script_background(eval_script_path, session_id, "eval_module")
+                eval_script = InterviewEvaluationModuleGemini()
+                result = eval_script.evaluate_interview_session(session_id)
+                logger.info(f"Evaluation result: {result}")
             else:
                 logger.warning("Evaluation module not available, skipping evaluation")
             # time.sleep(10)
@@ -869,8 +869,8 @@ class SessionManager:
             # eval_script = "Evaluation_Module_Gemini_V1.0.py"
             # pdf_script = "json_to_pdf.py"
             if PDF_GENERATION_AVAILABLE:
-                self._run_script_background(pdf_script_path, session_id, "json_to_pdf")
-                # generate_and_upload_report(session_id)
+                # self._run_script_background(pdf_script_path, session_id, "json_to_pdf")
+                generate_and_upload_report(session_id)
             else:
                 logger.warning("PDF generation module not available, skipping PDF generation")
 

@@ -533,7 +533,7 @@ def _get_existing_report_and_meta(client: Client, session_id: str) -> Dict[str, 
 
 def generate_and_upload_report(
 	session_id: str,
-	bucket: str = "interview-reports-gemini",
+	bucket: str = "interview-reports-pdf",
 	destination_prefix: str = "interview-reports-gemini",
 ) -> Dict[str, Any]:
 	"""End-to-end: fetch existing report JSON from DB, build PDF, and upload to storage.
