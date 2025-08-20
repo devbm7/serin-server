@@ -25,7 +25,8 @@ litellm
 requests
 
 # Google GenAI for ASR
-google-genai>=0.3.0
+google-genai
+google-generativeai
 
 
 # VAD
@@ -41,6 +42,7 @@ PyPDF2
 
 # Configuration
 pyyaml
+python-dotenv
 
 # Rich console (optional, for CLI output)
 rich

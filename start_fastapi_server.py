@@ -58,14 +58,14 @@ def check_dependencies():
         missing_deps.append("pyaudio")
     
     try:
-        from eval_module import InterviewEvaluationModuleGemini
+        from evalm import InterviewEvaluationModuleGemini
     except ImportError:
-        missing_deps.append("eval_module")
+        missing_deps.append("evalm")
     
     try:
-        from json_to_pdf import generate_and_upload_report
+        from pdf5 import generate_and_upload_report
     except ImportError:
-        missing_deps.append("json_to_pdf")
+        missing_deps.append("pdf5")
     
     if missing_deps:
         print(f"Missing dependencies: {', '.join(missing_deps)}")

@@ -26,8 +26,8 @@ COPY supabase_config.py .
 COPY fastapi_pipeline.py .
 COPY start_fastapi_server.py .
 COPY pipeline_config.yaml .
-COPY eval_module.py .
-COPY json_to_pdf.py .
+COPY evalm.py .
+COPY pdf5.py .
 
 # Copy local model directories if they exist (only for ASR)
 # COPY whisper-medium/ ./whisper-medium

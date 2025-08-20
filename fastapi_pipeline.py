@@ -102,7 +102,7 @@ except ImportError:
 
 # Adddition module imports
 try:
-    from eval_module import InterviewEvaluationModuleGemini
+    from evalm import InterviewEvaluationModuleGemini
     EVALUATION_MODULE_AVAILABLE = True
     logging.info("Evaluation module available")
 except ImportError:
@@ -110,7 +110,7 @@ except ImportError:
     logging.warning("Evaluation module not available")
 
 try:
-    from json_to_pdf import generate_and_upload_report
+    from pdf5 import generate_and_upload_report
     PDF_GENERATION_AVAILABLE = True
     logging.info("PDF generation module available")
 except ImportError:
@@ -854,10 +854,13 @@ class SessionManager:
     def start_post_session_jobs(self, session_id: str):
         """Start Evaluation and JSON-to-PDF scripts once session is saved."""
         try:
+            eval_script_path = Path("eval_module.py")
+            pdf_script_path = Path("json_to_pdf.py")
             if EVALUATION_MODULE_AVAILABLE:
-                eval_script = InterviewEvaluationModuleGemini()
-                result = eval_script.evaluate_interview_session(session_id)
-                logger.info(f"Evaluation result: {result}")
+                self._run_script_background(eval_script_path, session_id, "eval_module")
+                # eval_script = InterviewEvaluationModuleGemini()
+                # result = eval_script.evaluate_interview_session(session_id)
+                # logger.info(f"Evaluation result: {result}")
             else:
                 logger.warning("Evaluation module not available, skipping evaluation")
             # time.sleep(10)
@@ -866,7 +869,8 @@ class SessionManager:
             # eval_script = "Evaluation_Module_Gemini_V1.0.py"
             # pdf_script = "json_to_pdf.py"
             if PDF_GENERATION_AVAILABLE:
-                generate_and_upload_report(session_id)
+                self._run_script_background(pdf_script_path, session_id, "json_to_pdf")
+                # generate_and_upload_report(session_id)
             else:
                 logger.warning("PDF generation module not available, skipping PDF generation")
 
