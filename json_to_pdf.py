@@ -670,16 +670,23 @@ def generate_and_upload_report(
 	# Fetch interview data
 	interview_data = _get_interview_data(client, session_id)
 	
-	# Generate report using Gemini
-	report = _generate_report_with_gemini(
-		model, 
-		interview_data.get("transcript", ""), 
-		interview_data.get("questions", ""),
-		interview_data["meta"].get("role", "Unknown Role")
-	)
-	
-	# Update database with generated report
-	_update_interview_report(client, session_id, report)
+	# Check if evaluation report already exists
+	existing_report = interview_data.get("Interview_report")
+	if existing_report and isinstance(existing_report, dict) and existing_report.get("evaluation_summary"):
+		print(f"Using existing evaluation report for session {session_id}")
+		report = existing_report
+	else:
+		print(f"No existing evaluation found, generating new report with Gemini for session {session_id}")
+		# Generate report using Gemini
+		report = _generate_report_with_gemini(
+			model, 
+			interview_data.get("transcript", ""), 
+			interview_data.get("questions", ""),
+			interview_data["meta"].get("role", "Unknown Role")
+		)
+		
+		# Update database with generated report
+		_update_interview_report(client, session_id, report)
 	
 	# Generate PDF
 	pdf_bytes = generate_pdf_bytes(report, interview_data["meta"])
@@ -712,16 +719,23 @@ def analyze_interview_only(session_id: str) -> Dict[str, Any]:
 	# Fetch interview data
 	interview_data = _get_interview_data(client, session_id)
 	
-	# Generate report using Gemini
-	report = _generate_report_with_gemini(
-		model, 
-		interview_data.get("transcript", ""), 
-		interview_data.get("questions", ""),
-		interview_data["meta"].get("role", "Unknown Role")
-	)
-	
-	# Update database with generated report
-	_update_interview_report(client, session_id, report)
+	# Check if evaluation report already exists
+	existing_report = interview_data.get("Interview_report")
+	if existing_report and isinstance(existing_report, dict) and existing_report.get("evaluation_summary"):
+		print(f"Using existing evaluation report for session {session_id}")
+		report = existing_report
+	else:
+		print(f"No existing evaluation found, generating new report with Gemini for session {session_id}")
+		# Generate report using Gemini
+		report = _generate_report_with_gemini(
+			model, 
+			interview_data.get("transcript", ""), 
+			interview_data.get("questions", ""),
+			interview_data["meta"].get("role", "Unknown Role")
+		)
+		
+		# Update database with generated report
+		_update_interview_report(client, session_id, report)
 	
 	return {
 		"session_id": session_id,

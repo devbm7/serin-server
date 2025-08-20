@@ -26,7 +26,7 @@ COPY supabase_config.py .
 COPY fastapi_pipeline.py .
 COPY start_fastapi_server.py .
 COPY pipeline_config.yaml .
-COPY Evaluation_Module_Gemini_V1.0.py .
+COPY eval_module.py .
 COPY json_to_pdf.py .
 
 # Copy local model directories if they exist (only for ASR)
