@@ -865,10 +865,10 @@ class SessionManager:
             # Use scripts from current poc directory only
             # eval_script = "Evaluation_Module_Gemini_V1.0.py"
             # pdf_script = "json_to_pdf.py"
-            # if PDF_GENERATION_AVAILABLE:
-            #     generate_and_upload_report(session_id)
-            # else:
-            #     logger.warning("PDF generation module not available, skipping PDF generation")
+            if PDF_GENERATION_AVAILABLE:
+                generate_and_upload_report(session_id)
+            else:
+                logger.warning("PDF generation module not available, skipping PDF generation")
 
             # if not pdf_script.exists():
             #     logger.warning("JSON to PDF module script not found in poc directory")

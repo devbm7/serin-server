@@ -10,6 +10,7 @@ from pathlib import Path
 
 # Add current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 def setup_logging():
     """Setup logging configuration"""
@@ -56,9 +57,19 @@ def check_dependencies():
     except ImportError:
         missing_deps.append("pyaudio")
     
+    try:
+        from eval_module import InterviewEvaluationModuleGemini
+    except ImportError:
+        missing_deps.append("eval_module")
+    
+    try:
+        from json_to_pdf import generate_and_upload_report
+    except ImportError:
+        missing_deps.append("json_to_pdf")
+    
     if missing_deps:
         print(f"Missing dependencies: {', '.join(missing_deps)}")
-        print("Please install them using: pip install -r requirements_fastapi.txt")
+        print("Please install them using: pip install -r requirements.txt")
         return False
     
     return True
