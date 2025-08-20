@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
-import google.generativeai as genai
 
 # ReportLab for PDF generation
 from reportlab.lib.pagesizes import LETTER
@@ -69,282 +68,16 @@ def _init_supabase() -> Client:
 	return create_client(supabase_url, supabase_key)
 
 
-def _init_gemini() -> genai.GenerativeModel:
-	"""Initialize and return a Gemini API client using env vars.
-
-	Required env var:
-	- GEMINI_API_KEY
-	"""
-	api_key = os.getenv("GEMINI_API_KEY")
-	if not api_key:
-		raise RuntimeError("Missing GEMINI_API_KEY env var")
 	
-	genai.configure(api_key=api_key)
-	return genai.GenerativeModel('gemini-1.5-flash')
 
 
-def _get_interview_data(
-	client: Client, session_id: str
-) -> Dict[str, Any]:
-	"""Fetch interview data for a given session_id.
-
-	This fetches the raw interview data (transcript, questions, etc.) that will be
-	processed by Gemini to generate the report.
-	"""
-	# Select all columns to avoid errors when specific columns don't exist
-	resp = (
-		client.table("interview_sessions").select("*").eq("session_id", session_id).limit(1).execute()
-	)
-
-	data = getattr(resp, "data", None) or []
-	if not data:
-		# Some schemas may use `id` instead of `session_id`
-		resp = (
-			client.table("interview_sessions").select("*").eq("id", session_id).limit(1).execute()
-		)
-		data = getattr(resp, "data", None) or []
-
-	if not data:
-		raise ValueError(f"No interview session found for session_id/id: {session_id}")
-
-	row = data[0]
 	
-	# Extract relevant data for analysis
-	transcript = row.get("transcript") or row.get("interview_transcript")
-	questions = row.get("questions") or row.get("interview_questions")
-	
-	# Metadata
-	meta = {
-		"session_id": row.get("session_id") or row.get("id") or session_id,
-		"candidate_name": row.get("candidate_name"),
-		"role": row.get("role"),
-		"created_at": row.get("created_at"),
-	}
-	
-	return {
-		"transcript": transcript,
-		"questions": questions,
-		"meta": meta,
-		"raw_data": row
-	}
 
 
-def _generate_report_with_gemini(model: genai.GenerativeModel, transcript: str, questions: str, role: str) -> Dict[str, Any]:
-	"""Use Gemini API to analyze interview data and generate a structured report."""
-	
-	prompt = f"""
-	You are an expert interview evaluator. Analyze the following interview transcript and questions for a {role} position.
-	
-	Interview Questions:
-	{questions if questions else "No structured questions provided"}
-	
-	Interview Transcript:
-	{transcript if transcript else "No transcript provided"}
-	
-	Please provide a comprehensive evaluation in the following JSON format:
-	{{
-		"evaluation_summary": {{
-			"overall_score": "Score out of 10",
-			"overall_rating": "Excellent/Good/Average/Below Average/Poor",
-			"verdict": "Hire/Consider/Reject with reasoning",
-			"confidence": "High/Medium/Low confidence in assessment",
-			"notes": "Key observations and summary"
-		}},
-		"detailed_scores": {{
-			"technical_skills": {{
-				"overall_score": "Score out of 10",
-				"strengths": ["List of technical strengths"],
-				"areas_for_improvement": ["Areas needing development"],
-				"notes": "Detailed technical assessment"
-			}},
-			"communication": {{
-				"overall_score": "Score out of 10",
-				"strengths": ["Communication strengths"],
-				"areas_for_improvement": ["Communication areas for improvement"],
-				"notes": "Communication skills assessment"
-			}},
-			"problem_solving": {{
-				"overall_score": "Score out of 10",
-				"strengths": ["Problem-solving strengths"],
-				"areas_for_improvement": ["Problem-solving areas for improvement"],
-				"notes": "Problem-solving assessment"
-			}},
-			"cultural_fit": {{
-				"overall_score": "Score out of 10",
-				"strengths": ["Cultural fit strengths"],
-				"areas_for_improvement": ["Areas for cultural alignment"],
-				"notes": "Cultural fit assessment"
-			}}
-		}},
-		"recommendations": [
-			"Specific recommendations for the candidate",
-			"Suggestions for next steps",
-			"Development areas if hired"
-		],
-		"transcript_summary": "Concise summary of the key points from the interview"
-	}}
-	
-	Please ensure the response is valid JSON and provide thoughtful, detailed analysis based on the interview content.
-	If the transcript or questions are missing or incomplete, please note this in your assessment and provide what analysis you can.
-	"""
-	
-	try:
-		response = model.generate_content(prompt)
-		
-		# Extract text from response
-		if hasattr(response, 'text'):
-			response_text = response.text
-		elif hasattr(response, 'content') and hasattr(response.content, 'parts'):
-			response_text = response.content.parts[0].text
-		else:
-			response_text = str(response)
-		
-		# Clean up response text - remove markdown code blocks if present
-		response_text = response_text.strip()
-		if response_text.startswith('```json'):
-			response_text = response_text[7:]  # Remove ```json
-		if response_text.startswith('```'):
-			response_text = response_text[3:]   # Remove ```
-		if response_text.endswith('```'):
-			response_text = response_text[:-3]  # Remove closing ```
-		response_text = response_text.strip()
-		
-		# Parse JSON response
-		report = json.loads(response_text)
-		return report
-		
-	except json.JSONDecodeError as e:
-		print(f"Error parsing Gemini response as JSON: {e}")
-		print(f"Raw response: {response_text[:500]}...")
-		# Return a basic structure with the raw response
-		return {
-			"evaluation_summary": {
-				"overall_score": "N/A",
-				"overall_rating": "Unable to assess",
-				"verdict": "Analysis failed - JSON parsing error",
-				"confidence": "Low",
-				"notes": f"Gemini response could not be parsed as JSON: {str(e)}"
-			},
-			"raw_gemini_response": response_text
-		}
-	except Exception as e:
-		print(f"Error generating report with Gemini: {e}")
-		return {
-			"evaluation_summary": {
-				"overall_score": "N/A",
-				"overall_rating": "Unable to assess",
-				"verdict": f"Analysis failed - {str(e)}",
-				"confidence": "Low",
-				"notes": f"Error occurred during Gemini analysis: {str(e)}"
-			}
-		}
+ 
 
 
-def _update_interview_report(client: Client, session_id: str, report: Dict[str, Any]) -> None:
-	"""Update the interview session with the generated report."""
-	try:
-		# Prepare base update data
-		base_update = {
-			"Interview_report": report
-		}
-		
-		# Try to add optional columns if they exist
-		optional_columns = {
-			"report_generated_at": datetime.now(timezone.utc).isoformat(),
-			"report_source": "gemini"
-		}
-		
-		# Try updating with Interview_report column first (preferred)
-		try:
-			resp = client.table("interview_sessions").update({
-				**base_update,
-				**optional_columns
-			}).eq("session_id", session_id).execute()
-			
-			if getattr(resp, "data", None):
-				return  # Success!
-		except Exception as e:
-			# If optional columns fail, try with just the base update
-			if "could not find" in str(e).lower() or "pgrst204" in str(e).lower():
-				print(f"Optional columns not available, using base update only: {e}")
-				try:
-					resp = client.table("interview_sessions").update(base_update).eq("session_id", session_id).execute()
-					if getattr(resp, "data", None):
-						return  # Success!
-				except Exception:
-					pass
-			else:
-				print(f"Error with session_id lookup: {e}")
-		
-		# Try with id column instead
-		try:
-			resp = client.table("interview_sessions").update({
-				**base_update,
-				**optional_columns
-			}).eq("id", session_id).execute()
-			
-			if getattr(resp, "data", None):
-				return  # Success!
-		except Exception as e:
-			# If optional columns fail, try with just the base update
-			if "could not find" in str(e).lower() or "pgrst204" in str(e).lower():
-				try:
-					resp = client.table("interview_sessions").update(base_update).eq("id", session_id).execute()
-					if getattr(resp, "data", None):
-						return  # Success!
-				except Exception:
-					pass
-			else:
-				print(f"Error with id lookup: {e}")
-		
-		# Try with interview_report column (legacy)
-		legacy_update = {
-			"interview_report": report
-		}
-		
-		try:
-			resp = client.table("interview_sessions").update({
-				**legacy_update,
-				**optional_columns
-			}).eq("session_id", session_id).execute()
-			
-			if getattr(resp, "data", None):
-				return  # Success!
-		except Exception as e:
-			# If optional columns fail, try with just the legacy update
-			if "could not find" in str(e).lower() or "pgrst204" in str(e).lower():
-				try:
-					resp = client.table("interview_sessions").update(legacy_update).eq("session_id", session_id).execute()
-					if getattr(resp, "data", None):
-						return  # Success!
-				except Exception:
-					pass
-		
-		# Final attempt with id and legacy column
-		try:
-			resp = client.table("interview_sessions").update({
-				**legacy_update,
-				**optional_columns
-			}).eq("id", session_id).execute()
-			
-			if getattr(resp, "data", None):
-				return  # Success!
-		except Exception as e:
-			# If optional columns fail, try with just the legacy update
-			if "could not find" in str(e).lower() or "pgrst204" in str(e).lower():
-				try:
-					resp = client.table("interview_sessions").update(legacy_update).eq("id", session_id).execute()
-					if getattr(resp, "data", None):
-						return  # Success!
-				except Exception:
-					pass
-		
-		# If we get here, all attempts failed
-		raise Exception(f"Failed to update interview report for session {session_id}. Tried all column combinations.")
-				
-	except Exception as e:
-		print(f"Error updating interview report in database: {e}")
-		raise
+	
 
 
 def _find_header_image() -> Optional[str]:
@@ -444,7 +177,7 @@ def _build_pdf_story(report: Dict[str, Any], meta: Dict[str, Any]):
 		textColor=colors.HexColor("#0A2540"),
 		spaceAfter=12,
 	)
-	title = Paragraph("Interview Evaluation Report (Generated by Gemini AI)", title_style)
+	title = Paragraph("Interview Evaluation Report", title_style)
 	story.append(title)
 
 	# Metadata
@@ -457,8 +190,8 @@ def _build_pdf_story(report: Dict[str, Any], meta: Dict[str, Any]):
 			_para(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), styles["CellText"]),
 		],
 		[
-			Paragraph("Analysis Engine", styles["MetaLabel"]),
-			_para("Google Gemini AI", styles["CellText"]),
+			Paragraph("Report Source", styles["MetaLabel"]),
+			_para("Database interview_report", styles["CellText"]),
 		],
 	]
 	t = Table(meta_rows, colWidths=[130, 380])
@@ -594,7 +327,7 @@ def generate_pdf_bytes(report: Dict[str, Any], meta: Dict[str, Any]) -> bytes:
 		rightMargin=48,
 		topMargin=48,
 		bottomMargin=48,
-		title="Interview Evaluation Report (Gemini AI)",
+		title="Interview Evaluation Report",
 	)
 	story = _build_pdf_story(report, meta)
 	# Footer with page numbers
@@ -613,13 +346,31 @@ def generate_pdf_bytes(report: Dict[str, Any], meta: Dict[str, Any]) -> bytes:
 def _ensure_bucket(client: Client, bucket: str, public: bool = True) -> None:
 	"""Ensure the bucket exists; create it if missing (requires service role)."""
 	try:
-		buckets = client.storage.list_buckets()
-		existing = any((b.get("name") == bucket) for b in (buckets or []))
+		resp = client.storage.list_buckets()
+		# Normalize response to list of dicts
+		if isinstance(resp, dict):
+			bucket_list = resp.get("data") or resp.get("buckets") or []
+		else:
+			bucket_list = resp or []
+		existing = any(((b or {}).get("name") == bucket) for b in bucket_list)
 		if not existing:
-			client.storage.create_bucket(bucket, public=public)
+			# Try multiple call signatures for broad SDK compatibility
+			created = None
+			try:
+				created = client.storage.create_bucket(bucket, {"public": public})
+			except Exception:
+				try:
+					created = client.storage.create_bucket(bucket_id=bucket, public=public)
+				except Exception:
+					try:
+						created = client.storage.create_bucket({"id": bucket, "name": bucket, "public": public})
+					except Exception:
+						pass
+			# Optionally verify after create
+			return
 	except Exception:
-		# If the SDK version doesn't support list/create in this environment, ignore and proceed.
-		pass
+		# Best effort; continue even if ensure fails
+		return
 
 
 def upload_pdf_to_bucket(
@@ -632,124 +383,215 @@ def upload_pdf_to_bucket(
 	# Ensure path is normalized and unique-ish
 	if not dest_path.lower().endswith(".pdf"):
 		dest_path = dest_path + ".pdf"
+	# Remove leading slashes and accidental bucket duplication in path
+	dest_path = dest_path.lstrip("/")
+	if dest_path.startswith(f"{bucket}/"):
+		dest_path = dest_path[len(bucket) + 1:]
 
 	# Ensure bucket exists (best effort)
 	_ensure_bucket(client, bucket, public=True)
 
-	# Upload (upsert allowed so reruns overwrite) using proper kwargs
-	res = client.storage.from_(bucket).upload(
-		dest_path,
-		pdf_bytes,
-		{
-			"contentType": "application/pdf",
-			"cacheControl": "3600",
-			"upsert": "true",
-		},
-	)
-	# Get a public URL (requires bucket to be public or signed URLs logic)
+	# Upload (upsert allowed so reruns overwrite) using proper kwargs, with one retry on missing bucket
+	def _do_upload():
+		return client.storage.from_(bucket).upload(
+			dest_path,
+			pdf_bytes,
+			{
+				"contentType": "application/pdf",
+				"cacheControl": "3600",
+				"upsert": "true",
+			},
+		)
+	try:
+		res = _do_upload()
+	except Exception as e:
+		if "Bucket not found" in str(e):
+			_ensure_bucket(client, bucket, public=True)
+			res = _do_upload()
+		else:
+			raise
+	# Get a public URL (requires bucket to be public)
 	public_url = client.storage.from_(bucket).get_public_url(dest_path)
 	# Normalize return to a string if SDK returns dict
 	if isinstance(public_url, dict):
-		public_url = public_url.get("data") or public_url.get("publicUrl") or public_url.get("public_url")
-	return {"upload": res, "public_url": public_url}
+		public_url = (
+			public_url.get("publicUrl")
+			or public_url.get("public_url")
+			or (public_url.get("data") or {}).get("publicUrl")
+			or (public_url.get("data") or {}).get("public_url")
+		)
+
+	# Also create a signed URL for reliable access if bucket is private
+	signed_url = None
+	try:
+		signed = client.storage.from_(bucket).create_signed_url(dest_path, 60 * 60 * 24 * 30)
+		# Normalize different shapes
+		if isinstance(signed, dict):
+			# supabase-py often returns {'data': {'signedUrl': '...'} }
+			signed_url = (
+				(signed.get("data") or {}).get("signedUrl")
+				or (signed.get("data") or {}).get("signedURL")
+				or signed.get("signedUrl")
+				or signed.get("signedURL")
+			)
+	except Exception:
+		pass
+
+	# Normalize URLs to absolute
+	base_url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+	def _absolutize(url: Optional[str]) -> Optional[str]:
+		if not url:
+			return url
+		if url.startswith("http://") or url.startswith("https://"):
+			return url
+		if base_url:
+			# Handle paths like '/storage/v1/object/...' or 'storage/v1/object/...'
+			path = url
+			if path.startswith("/"):
+				return f"{base_url}{path}"
+			return f"{base_url}/{path}"
+		return url
+
+	public_url = _absolutize(public_url)
+	signed_url = _absolutize(signed_url)
+
+	return {"upload": res, "public_url": public_url, "signed_url": signed_url}
+
+
+def _update_pdf_url(client: Client, session_id: str, public_url: Optional[str]) -> None:
+	"""Update the interview row with the generated PDF's public URL.
+
+	Attempts updates against `interview_sessions` first, then `interview_session`,
+	matching by `session_id` then by `id`.
+	"""
+	if not public_url:
+		return
+	payload = {"interview_report_pdf_url": public_url}
+	for table_name in ["interview_sessions", "interview_session"]:
+		try:
+			resp = client.table(table_name).update(payload).eq("session_id", session_id).execute()
+			if getattr(resp, "data", None):
+				return
+		except Exception:
+			pass
+		try:
+			resp = client.table(table_name).update(payload).eq("id", session_id).execute()
+			if getattr(resp, "data", None):
+				return
+		except Exception:
+			pass
+	# If all attempts fail, do not raise; keep operation best-effort
+	return
+
+
+def _get_existing_report_and_meta(client: Client, session_id: str) -> Dict[str, Any]:
+	"""Fetch the existing interview report JSON and metadata from `interview_sessions.interview_report` with fallbacks."""
+	# Primary: interview_sessions.interview_report
+	try:
+		resp = client.table("interview_sessions").select("*").eq("session_id", session_id).limit(1).execute()
+		data = getattr(resp, "data", None) or []
+		if not data:
+			resp = client.table("interview_sessions").select("*").eq("id", session_id).limit(1).execute()
+			data = getattr(resp, "data", None) or []
+		if data:
+			row = data[0]
+			report = row.get("interview_report") or row.get("Interview_report")
+			if report:
+				meta = {
+					"session_id": row.get("session_id") or row.get("id") or session_id,
+					"candidate_name": row.get("candidate_name"),
+					"role": row.get("role"),
+					"created_at": row.get("created_at"),
+				}
+				return {"report": report, "meta": meta}
+	except Exception:
+		pass
+
+	# Fallback: legacy table name interview_session
+	try:
+		resp = client.table("interview_session").select("*").eq("session_id", session_id).limit(1).execute()
+		data = getattr(resp, "data", None) or []
+		if not data:
+			resp = client.table("interview_session").select("*").eq("id", session_id).limit(1).execute()
+			data = getattr(resp, "data", None) or []
+		if data:
+			row = data[0]
+			report = row.get("interview_report") or row.get("Interview_report")
+			if report:
+				meta = {
+					"session_id": row.get("session_id") or row.get("id") or session_id,
+					"candidate_name": row.get("candidate_name"),
+					"role": row.get("role"),
+					"created_at": row.get("created_at"),
+				}
+				return {"report": report, "meta": meta}
+	except Exception:
+		pass
+
+	raise ValueError(f"No existing interview_report found for session {session_id}.")
 
 
 def generate_and_upload_report(
 	session_id: str,
-	bucket: str = "interview-report-pdf",
+	bucket: str = "interview-reports-gemini",
 	destination_prefix: str = "interview-reports-gemini",
 ) -> Dict[str, Any]:
-	"""End-to-end: fetch interview data from DB, analyze with Gemini, build PDF, and upload to storage.
+	"""End-to-end: fetch existing report JSON from DB, build PDF, and upload to storage.
 
 	Returns a dict with keys: session_id, bucket, path, public_url, report_data
 	"""
 	_load_env()
 	client = _init_supabase()
-	model = _init_gemini()
 
-	# Fetch interview data
-	interview_data = _get_interview_data(client, session_id)
-	
-	# Check if evaluation report already exists
-	existing_report = interview_data.get("Interview_report")
-	if existing_report and isinstance(existing_report, dict) and existing_report.get("evaluation_summary"):
-		print(f"Using existing evaluation report for session {session_id}")
-		report = existing_report
-	else:
-		print(f"No existing evaluation found, generating new report with Gemini for session {session_id}")
-		# Generate report using Gemini
-		report = _generate_report_with_gemini(
-			model, 
-			interview_data.get("transcript", ""), 
-			interview_data.get("questions", ""),
-			interview_data["meta"].get("role", "Unknown Role")
-		)
-		
-		# Update database with generated report
-		_update_interview_report(client, session_id, report)
-	
-	# Generate PDF
-	pdf_bytes = generate_pdf_bytes(report, interview_data["meta"])
+	# Fetch existing report and metadata
+	retrieved = _get_existing_report_and_meta(client, session_id)
+	report = retrieved["report"]
+	# Allow for stringified JSON stored in the column
+	if isinstance(report, str):
+		try:
+			report = json.loads(report)
+		except Exception:
+			pass
+	# Ensure the report is a dict to avoid rendering errors
+	if not isinstance(report, dict):
+		report = {
+			"evaluation_summary": {
+				"overall_score": "N/A",
+				"overall_rating": "N/A",
+				"verdict": "Existing report is not a JSON object",
+				"confidence": "Low",
+				"notes": "The value in Interview_report could not be parsed into a JSON object. Including raw content below."
+			},
+			"raw_report": report
+		}
+	meta = retrieved["meta"]
+
+	# Generate PDF directly from existing report
+	pdf_bytes = generate_pdf_bytes(report, meta)
 
 	# Store under a cleaner path: interview-reports-gemini/<session_id>/interview_report.pdf
 	filename = "interview_report_gemini.pdf"
 	dest_path = f"{destination_prefix}/{session_id}/{filename}"
 	upload_info = upload_pdf_to_bucket(client, bucket, dest_path, pdf_bytes)
 
+	# Persist a usable URL back to the interview row (prefer signed when present)
+	usable_url = upload_info.get("signed_url") or upload_info.get("public_url")
+	_update_pdf_url(client, session_id, usable_url)
+
 	return {
 		"session_id": session_id,
 		"bucket": bucket,
 		"path": dest_path,
-		"public_url": upload_info.get("public_url"),
+		"public_url": upload_info.get("signed_url") or upload_info.get("public_url"),
 		"report_data": report,
-		"analysis_engine": "gemini"
+		"report_source": "existing_column"
 	}
-
-
-def analyze_interview_only(session_id: str) -> Dict[str, Any]:
-	"""Only analyze interview data with Gemini and update database (no PDF generation).
-	
-	This function is useful when you only want to generate the analysis
-	without creating a PDF report.
-	"""
-	_load_env()
-	client = _init_supabase()
-	model = _init_gemini()
-
-	# Fetch interview data
-	interview_data = _get_interview_data(client, session_id)
-	
-	# Check if evaluation report already exists
-	existing_report = interview_data.get("Interview_report")
-	if existing_report and isinstance(existing_report, dict) and existing_report.get("evaluation_summary"):
-		print(f"Using existing evaluation report for session {session_id}")
-		report = existing_report
-	else:
-		print(f"No existing evaluation found, generating new report with Gemini for session {session_id}")
-		# Generate report using Gemini
-		report = _generate_report_with_gemini(
-			model, 
-			interview_data.get("transcript", ""), 
-			interview_data.get("questions", ""),
-			interview_data["meta"].get("role", "Unknown Role")
-		)
-		
-		# Update database with generated report
-		_update_interview_report(client, session_id, report)
-	
-	return {
-		"session_id": session_id,
-		"report_data": report,
-		"analysis_engine": "gemini",
-		"status": "analysis_complete"
-	}
-
 
 def _main_cli():
 	import argparse
 
 	parser = argparse.ArgumentParser(
-		description="Generate an interview report using Gemini AI from Supabase data and upload PDF to Storage"
+		description="Build a PDF from an existing Interview_report in the database and upload it to Storage (no re-analysis)"
 	)
 	parser.add_argument("--session-id", "--session", required=True, help="Interview session UUID", dest="session_id")
 	parser.add_argument(
@@ -765,14 +607,12 @@ def _main_cli():
 	parser.add_argument(
 		"--analysis-only",
 		action="store_true",
-		help="Only perform analysis and update database (no PDF generation)"
+		help=argparse.SUPPRESS
 	)
 	args = parser.parse_args()
 
-	if args.analysis_only:
-		result = analyze_interview_only(session_id=args.session_id)
-	else:
-		result = generate_and_upload_report(
+	# Always build PDF from existing Interview_report
+	result = generate_and_upload_report(
 			session_id=args.session_id, 
 			bucket=args.bucket, 
 			destination_prefix=args.prefix
