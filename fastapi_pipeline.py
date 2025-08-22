@@ -1107,7 +1107,7 @@ class SessionManager:
             "is_processing": False,  # Processing flag
             "processing_thread": None,  # Background processing thread
             "chunks_per_second": 16000 / 512,  # Calculate chunks per second (31.25 chunks/sec for 32ms chunks)
-            "silent_chunks_threshold": int(1.4 * (16000 / 512)),  # 1.4 seconds of silence (~43.8 chunks)
+            "silent_chunks_threshold": int(3 * (16000 / 512)),  # 3 seconds of silence (~93.8 chunks)
         }
         
         # Store session immediately so it's available for retrieval

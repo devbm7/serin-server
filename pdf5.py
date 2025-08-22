@@ -404,14 +404,22 @@ def upload_pdf_to_bucket(
 		)
 	try:
 		res = _do_upload()
+		print(f"Upload successful: {res}")
 	except Exception as e:
+		print(f"Upload failed with error: {e}")
 		if "Bucket not found" in str(e):
+			print("Attempting to create bucket...")
 			_ensure_bucket(client, bucket, public=True)
 			res = _do_upload()
+		elif "row-level security policy" in str(e) or "Unauthorized" in str(e):
+			print("ERROR: Storage upload failed due to RLS/permission restrictions")
+			print("This means the service account doesn't have permission to upload to this bucket")
+			raise RuntimeError(f"Storage permission denied: {e}")
 		else:
 			raise
 	# Get a public URL (requires bucket to be public)
 	public_url = client.storage.from_(bucket).get_public_url(dest_path)
+	
 	# Normalize return to a string if SDK returns dict
 	if isinstance(public_url, dict):
 		public_url = (
@@ -420,6 +428,17 @@ def upload_pdf_to_bucket(
 			or (public_url.get("data") or {}).get("publicUrl")
 			or (public_url.get("data") or {}).get("public_url")
 		)
+	
+	# Clean the public URL by removing trailing query parameters
+	if public_url and isinstance(public_url, str):
+		public_url = public_url.rstrip('?')
+	
+	# Ensure we're getting a public URL, not a signed URL
+	if public_url and "/object/sign/" in public_url:
+		# Construct the public URL manually if SDK returns signed URL by mistake
+		base_url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+		if base_url:
+			public_url = f"{base_url}/storage/v1/object/public/{bucket}/{dest_path}"
 
 	# Also create a signed URL for reliable access if bucket is private
 	signed_url = None
@@ -574,15 +593,15 @@ def generate_and_upload_report(
 	dest_path = f"{destination_prefix}/{session_id}/{filename}"
 	upload_info = upload_pdf_to_bucket(client, bucket, dest_path, pdf_bytes)
 
-	# Persist a usable URL back to the interview row (prefer signed when present)
-	usable_url = upload_info.get("signed_url") or upload_info.get("public_url")
-	_update_pdf_url(client, session_id, usable_url)
+	# Persist the public URL back to the interview row
+	public_url = upload_info.get("public_url")
+	_update_pdf_url(client, session_id, public_url)
 
 	return {
 		"session_id": session_id,
 		"bucket": bucket,
 		"path": dest_path,
-		"public_url": upload_info.get("signed_url") or upload_info.get("public_url"),
+		"public_url": upload_info.get("public_url"),
 		"report_data": report,
 		"report_source": "existing_column"
 	}
