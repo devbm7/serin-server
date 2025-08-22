@@ -896,57 +896,7 @@ class SessionManager:
         except Exception as e:
             logger.error(f"Failed to start post-session jobs for session {session_id}: {e}")
 
-    def start_post_session_jobs_delayed(self, session_id: str):
-        """Start post-session jobs after waiting for video processing and a delay."""
-        def delayed_job():
-            try:
-                logger.info(f"Starting delayed post-session jobs for session {session_id}")
-                
-                # Wait 5 seconds to let any video processing complete and changes propagate
-                time.sleep(5)
-                logger.info(f"5-second delay completed for session {session_id}, starting evaluation and PDF generation")
-                
-                # Re-save session to database with updated anomaly information
-                if session_id in self.sessions:
-                    session_data = self.sessions[session_id]
-                    logger.info(f"Re-saving session {session_id} with updated anomaly information")
-                    logger.info(f"Current conversation history length in memory: {len(session_data.get('conversation_history', []))}")
-                    self.save_session_to_database(session_id, session_data, skip_post_processing=True)
-                
-                # Now run the post-processing jobs
-                self.start_post_session_jobs(session_id)
-                logger.info(f"Delayed post-session jobs completed for session {session_id}")
-                
-                # Clean up session from memory if it was marked for cleanup
-                if session_id in self.sessions:
-                    session_data = self.sessions[session_id]
-                    if session_data.get("marked_for_cleanup_after_recording"):
-                        logger.info(f"Cleaning up session {session_id} after post-processing completion")
-                        # Stop processing thread if running
-                        if session_data.get("processing_thread") and session_data["processing_thread"].is_alive():
-                            session_data["processing_thread"].join(timeout=1)
-                        
-                        # Clear audio queue
-                        while not session_data["audio_queue"].empty():
-                            try:
-                                session_data["audio_queue"].get_nowait()
-                            except queue.Empty:
-                                break
-                        
-                        del self.sessions[session_id]
-                        # Clean up activity tracking
-                        if session_id in self.last_activity:
-                            del self.last_activity[session_id]
-                        logger.info(f"Session {session_id} cleaned up after post-processing")
-                
-            except Exception as e:
-                logger.error(f"Failed to run delayed post-session jobs for session {session_id}: {e}")
-        
-        # Start the delayed job in a background thread
-        delayed_thread = threading.Thread(target=delayed_job, daemon=True)
-        delayed_thread.start()
-        logger.info(f"Started delayed post-session jobs thread for session {session_id}")
-        return delayed_thread
+
         
     def _session_cleanup_worker(self):
         """Background thread to clean up inactive sessions."""
@@ -965,10 +915,9 @@ class SessionManager:
                     try:
                         if session_id in self.sessions:
                             session_data = self.sessions[session_id]
-                            self.save_session_to_database(session_id, session_data, skip_post_processing=True)
-                            # Mark session as awaiting recording for delayed post-processing
-                            session_data["awaiting_recording_for_postprocessing"] = True
-                            logger.info(f"Session {session_id} auto-saved due to timeout, marked for delayed post-processing")
+                            session_data["status"] = "completed"
+                            self.save_session_to_database(session_id, session_data, skip_post_processing=False)
+                            logger.info(f"Session {session_id} auto-saved due to timeout with immediate post-processing")
                         
                         # Clean up session
                         self.delete_session(session_id)
@@ -1275,7 +1224,7 @@ class SessionManager:
             else:
                 logger.warning(f"No recording URL found for session {session_id}")
             
-            # Get detection data for anomalies
+            # Get detection data for anomalies (video processing happens after this)
             detection_data = self.get_detection_data(session_id)
             anomalies_detected = []
             if detection_data and detection_data.get("capture_data"):
@@ -1371,10 +1320,13 @@ class SessionManager:
                 logger.info(f"  - Recording URL: {update_data['recording_url']}")
                 logger.info(f"  - Conversation messages: {len(conversation_history)}")
                 logger.info(f"  - Anomalies detected: {len(anomalies_detected)}")
-                # Trigger post-processing scripts once per session (unless skipped)
+                
+                # Trigger post-processing scripts immediately after database save (unless skipped)
                 if not skip_post_processing and session_id not in self.postprocess_started:
                     self.postprocess_started.add(session_id)
+                    logger.info(f"Starting immediate post-processing jobs for session {session_id}")
                     self.start_post_session_jobs(session_id)
+                    logger.info(f"Post-processing jobs completed for session {session_id}")
             else:
                 logger.error(f"Failed to update session {session_id} information in database")
                 
@@ -2160,21 +2112,17 @@ async def upload_recording(
         recording_info = session_manager.save_recording(session_id, recording_data, filename)
         
         # Fallback: Complete session if not already completed (in case WebSocket disconnected unexpectedly)
-        # Use delayed completion to allow video processing anomalies to be included
         try:
             if session_id in session_manager.sessions:
                 session_data = session_manager.sessions[session_id]
                 if session_data.get("status") != "completed":
                     logger.info(f"Fallback: Completing session {session_id} during recording upload (WebSocket may have disconnected)")
                     
-                    # Save session immediately without post-processing
-                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                    # Save session with immediate post-processing (evaluation and PDF generation)
+                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
                     session_data["status"] = "completed"
                     
-                    # Mark session as awaiting recording for delayed post-processing
-                    session_data["awaiting_recording_for_postprocessing"] = True
-                    
-                    logger.info(f"Fallback: Session {session_id} completed successfully during recording upload, marked for delayed post-processing")
+                    logger.info(f"Fallback: Session {session_id} completed successfully during recording upload with immediate post-processing")
                 else:
                     logger.info(f"Session {session_id} already completed, skipping fallback completion")
             else:
@@ -2209,13 +2157,8 @@ async def upload_recording(
                     if update_success:
                         logger.info(f"Updated existing session with recording URL")
                         
-                        # Check if session is awaiting post-processing and trigger it now
-                        if session_id in session_manager.sessions:
-                            session_data = session_manager.sessions[session_id]
-                            if session_data.get("awaiting_recording_for_postprocessing"):
-                                logger.info(f"Recording uploaded for session {session_id}, starting delayed post-processing")
-                                session_data["awaiting_recording_for_postprocessing"] = False
-                                session_manager.start_post_session_jobs_delayed(session_id)
+                        # Post-processing is now handled immediately during session completion
+                        logger.info(f"Recording URL updated for completed session {session_id}")
                         
                     else:
                         logger.info(f"No existing session found to update with recording URL for {session_id}")
@@ -2791,17 +2734,14 @@ async def end_session(session_id: str):
         if session_id not in session_manager.sessions:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Save session information first without immediate post-processing
+        # Save session information with immediate post-processing
         session_data = session_manager.sessions[session_id]
-        session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+        session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
         
-        # Mark session as awaiting recording for delayed post-processing
-        session_data["awaiting_recording_for_postprocessing"] = True
-        session_data["marked_for_cleanup_after_recording"] = True
+        # Update session status to completed
+        session_data["status"] = "completed"
         
-        # Don't delete the session yet - keep it in memory until recording is uploaded
-        # The session will be cleaned up by the delayed post-processing after completion
-        logger.info(f"Session {session_id} marked for cleanup after recording upload and post-processing")
+        logger.info(f"Session {session_id} ended and post-processing completed")
         
         return {
             "status": "ended",
@@ -2831,17 +2771,13 @@ async def complete_session(session_id: str):
         session_data = session_manager.sessions[session_id]
         logger.info(f"Saving session {session_id} to database with conversation history length: {len(session_data.get('conversation_history', []))}")
         
-        # Save session without immediate post-processing to allow video anomalies to be included
-        session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+        # Save session with immediate post-processing
+        session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
         logger.info(f"Session {session_id} saved to database successfully")
         
         # Update session status to completed
         session_data["status"] = "completed"
-        logger.info(f"Session {session_id} status updated to completed")
-        
-        # Mark session as awaiting recording for delayed post-processing
-        session_data["awaiting_recording_for_postprocessing"] = True
-        logger.info(f"Session {session_id} marked as awaiting recording for post-processing")
+        logger.info(f"Session {session_id} status updated to completed and post-processing completed")
         
         return {
             "status": "completed",
@@ -3147,7 +3083,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 # Check if this is a WebSocket disconnection error
                 if "1005" in str(e) or "1001" in str(e) or "1000" in str(e):
                     logger.info(f"WebSocket disconnection detected for session {session_id}, triggering auto-save")
-                    # Trigger auto-save for WebSocket disconnection
+                    # Trigger auto-save with immediate post-processing for WebSocket disconnection
                     try:
                         if session_id in session_manager.sessions:
                             session_data = session_manager.sessions[session_id]
@@ -3159,13 +3095,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 # Update session status to completed
                                 session_data["status"] = "completed"
                                 
-                                # Save session information without immediate post-processing
-                                session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                                # Save session information with immediate post-processing
+                                session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
                                 
-                                # Mark session as awaiting recording for delayed post-processing
-                                session_data["awaiting_recording_for_postprocessing"] = True
-                                
-                                logger.info(f"Session {session_id} auto-saved successfully, marked for delayed post-processing")
+                                logger.info(f"Session {session_id} auto-saved successfully with immediate post-processing")
                             else:
                                 logger.info(f"Session {session_id} already completed, skipping auto-save")
                         else:
@@ -3184,7 +3117,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for session {session_id}")
-        # Auto-save session when WebSocket disconnects
+        # Auto-save session with immediate post-processing when WebSocket disconnects
         try:
             if session_id in session_manager.sessions:
                 session_data = session_manager.sessions[session_id]
@@ -3196,13 +3129,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     # Update session status to completed
                     session_data["status"] = "completed"
                     
-                    # Save session information without immediate post-processing
-                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                    # Save session information with immediate post-processing
+                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
                     
-                    # Mark session as awaiting recording for delayed post-processing
-                    session_data["awaiting_recording_for_postprocessing"] = True
-                    
-                    logger.info(f"Session {session_id} auto-saved successfully, marked for delayed post-processing")
+                    logger.info(f"Session {session_id} auto-saved successfully with immediate post-processing")
                 else:
                     logger.info(f"Session {session_id} already completed, skipping auto-save")
             else:
@@ -3217,7 +3147,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await websocket.send_text(json.dumps({"error": str(e)}))
         except:
             pass
-        # Auto-save session on any WebSocket error
+        # Auto-save session with immediate post-processing on any WebSocket error
         try:
             if session_id in session_manager.sessions:
                 session_data = session_manager.sessions[session_id]
@@ -3229,13 +3159,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     # Update session status to completed
                     session_data["status"] = "completed"
                     
-                    # Save session information without immediate post-processing
-                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                    # Save session information with immediate post-processing
+                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
                     
-                    # Mark session as awaiting recording for delayed post-processing
-                    session_data["awaiting_recording_for_postprocessing"] = True
-                    
-                    logger.info(f"Session {session_id} auto-saved successfully after error, marked for delayed post-processing")
+                    logger.info(f"Session {session_id} auto-saved successfully after error with immediate post-processing")
                 else:
                     logger.info(f"Session {session_id} already completed, skipping auto-save after error")
             else:
