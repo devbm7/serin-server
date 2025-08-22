@@ -419,6 +419,15 @@ class AudioChunk(BaseModel):
     sample_rate: int
     chunk_size: int
 
+class VideoFrame(BaseModel):
+    type: str
+    frame_data: str
+    timestamp: int
+    frame_number: int
+    width: int
+    height: int
+    format: str
+
 class InterviewResponse(BaseModel):
     transcription: str
     response: str
@@ -991,7 +1000,7 @@ class SessionManager:
             "is_processing": False,  # Processing flag
             "processing_thread": None,  # Background processing thread
             "chunks_per_second": 16000 / 512,  # Calculate chunks per second (31.25 chunks/sec for 32ms chunks)
-            "silent_chunks_threshold": int(1.4 * (16000 / 512)),  # 1.4 seconds of silence (~43.8 chunks)
+            "silent_chunks_threshold": int(3 * (16000 / 512)),  # 3 seconds of silence (~95.6 chunks)
         }
         
         # Store session immediately so it's available for retrieval
@@ -1107,7 +1116,7 @@ class SessionManager:
             "is_processing": False,  # Processing flag
             "processing_thread": None,  # Background processing thread
             "chunks_per_second": 16000 / 512,  # Calculate chunks per second (31.25 chunks/sec for 32ms chunks)
-            "silent_chunks_threshold": int(3 * (16000 / 512)),  # 3 seconds of silence (~93.8 chunks)
+            "silent_chunks_threshold": int(1.4 * (16000 / 512)),  # 1.4 seconds of silence (~43.8 chunks)
         }
         
         # Store session immediately so it's available for retrieval
@@ -1315,6 +1324,10 @@ class SessionManager:
             # Determine ASR model used based on session data
             asr_model_used = "gemini-2.5-flash"
             
+            # Get video frame statistics
+            video_frame_count = len(session_data.get("video_frames", []))
+            video_streaming_enabled = video_frame_count > 0
+            
             # Prepare session information JSON (without resume_url and recording_url)
             session_information = {
                 "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
@@ -1322,7 +1335,13 @@ class SessionManager:
                 "anomalies_detected": anomalies_detected,
                 "asr_model": asr_model_used,  # Dynamic based on what was actually used
                 "llm_provider": "gemini",  # Fixed provider
-                "llm_model": "gemini-2.5-flash"  # Fixed model
+                "llm_model": "gemini-2.5-flash",  # Fixed model
+                "video_streaming": {
+                    "enabled": video_streaming_enabled,
+                    "frame_count": video_frame_count,
+                    "first_frame_timestamp": session_data.get("video_frames", [{}])[0].get("timestamp") if session_data.get("video_frames") else None,
+                    "last_frame_timestamp": session_data.get("video_frames", [{}])[-1].get("timestamp") if session_data.get("video_frames") else None
+                }
             }
             
             # Convert datetime to ISO format string for JSON serialization
@@ -2418,6 +2437,31 @@ async def get_detection_data(session_id: str):
         logger.error(f"Failed to get detection data for session {session_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/sessions/{session_id}/video-frames")
+async def get_session_video_frames(session_id: str):
+    """Get video frame data for a session."""
+    try:
+        # Validate session exists
+        if session_id not in session_manager.sessions:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        session_data = session_manager.sessions[session_id]
+        video_frames = session_data.get("video_frames", [])
+        
+        return {
+            "session_id": session_id,
+            "video_frames_available": len(video_frames) > 0,
+            "frame_count": len(video_frames),
+            "video_frames": video_frames[:100] if len(video_frames) > 100 else video_frames,  # Limit to first 100 frames
+            "total_frames": len(video_frames)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get video frames for session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/recordings/{session_id}/anomalies")
 async def get_anomaly_detection_summary(session_id: str):
     """Get anomaly detection summary for a session."""
@@ -3033,7 +3077,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 # Parse and process audio data
                 try:
                     audio_data = json.loads(data)
-                    logger.debug(f"Parsed audio data: type={audio_data.get('type')}, sample_rate={audio_data.get('sample_rate')}")
+                    logger.debug(f"Parsed data: type={audio_data.get('type')}")
                     
                     if audio_data.get('type') == 'audio_chunk':
                         # Decode audio data
@@ -3059,6 +3103,30 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 logger.error(f"Failed to send response to session {session_id}: {e}")
                                 # Try to send error response
                                 await websocket.send_text(json.dumps({"error": "Failed to process response"}))
+                    
+                    elif audio_data.get('type') == 'video_frame':
+                        # Handle video frame data
+                        frame_data = audio_data
+                        logger.debug(f"Received video frame {frame_data.get('frame_number')} for session {session_id}")
+                        
+                        # Store video frame data for later processing (not processed live)
+                        if "video_frames" not in session:
+                            session["video_frames"] = []
+                        
+                        # Limit stored frames to prevent memory issues (keep last 1000 frames)
+                        if len(session["video_frames"]) >= 1000:
+                            session["video_frames"] = session["video_frames"][-500:]  # Keep last 500
+                        
+                        session["video_frames"].append({
+                            "frame_data": frame_data.get("frame_data"),
+                            "timestamp": frame_data.get("timestamp"),
+                            "frame_number": frame_data.get("frame_number"),
+                            "width": frame_data.get("width"),
+                            "height": frame_data.get("height"),
+                            "format": frame_data.get("format")
+                        })
+                        
+                        logger.debug(f"Stored video frame {frame_data.get('frame_number')} for session {session_id}")
                 
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON decode error for session {session_id}: {e}")
