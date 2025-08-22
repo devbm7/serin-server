@@ -404,6 +404,10 @@ class ModelSelectionRequest(BaseModel):
     resume_url: str  # Direct path to resume in Supabase storage
     # Removed user-provided model options - will use preloaded models only
 
+class DevicePreferences(BaseModel):
+    camera_device_id: Optional[str] = None
+    microphone_device_id: Optional[str] = None
+
 class SessionInitializationRequest(BaseModel):
     session_id: str  # Database session ID
     job_role: str  # From job template
@@ -412,6 +416,7 @@ class SessionInitializationRequest(BaseModel):
     llm_provider: str = "gemini"
     llm_model: str = "gemini-2.5-flash"
     asr_model: str = "gemini-2.5-pro"
+    device_preferences: Optional[DevicePreferences] = None
 
 class AudioChunk(BaseModel):
     type: str
@@ -1109,6 +1114,7 @@ class SessionManager:
             "status": "initializing",  # Start with initializing status
             "created_at": datetime.now(),
             "model_request": model_request,
+            "device_preferences": init_request.device_preferences.dict() if init_request.device_preferences else None,
             "conversation_history": [],
             "audio_queue": queue.Queue(maxsize=1000),  # Audio buffer queue
             "current_utterance": [],  # Current utterance buffer
@@ -2658,7 +2664,8 @@ async def get_session(session_id: str):
             "session_id": session_id,
             "status": session["status"],
             "created_at": session["created_at"],
-            "conversation_length": len(session["conversation_history"])
+            "conversation_length": len(session["conversation_history"]),
+            "device_preferences": session.get("device_preferences")
         }
     except HTTPException:
         raise
