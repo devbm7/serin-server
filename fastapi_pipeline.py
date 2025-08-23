@@ -455,6 +455,9 @@ class RecordingInfo(BaseModel):
     bucket: Optional[str] = None
     storage_type: str = "supabase"  # "supabase" or "local"
 
+class SessionCompletionRequest(BaseModel):
+    recording_url: Optional[str] = None
+
 
 class VideoAnnotationProcessor:
     def __init__(self):
@@ -916,8 +919,13 @@ class SessionManager:
                         if session_id in self.sessions:
                             session_data = self.sessions[session_id]
                             session_data["status"] = "completed"
-                            self.save_session_to_database(session_id, session_data, skip_post_processing=False)
-                            logger.info(f"Session {session_id} auto-saved due to timeout with immediate post-processing")
+                            self.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                            
+                            # Start post-processing in background
+                            import asyncio
+                            asyncio.create_task(start_post_processing_background(session_id))
+                            
+                            logger.info(f"Session {session_id} auto-saved due to timeout with background post-processing")
                         
                         # Clean up session
                         self.delete_session(session_id)
@@ -1514,6 +1522,78 @@ Based on the resume, ask one insightful question related to the topic to start t
 
 # Global session manager instance
 session_manager = SessionManager()
+
+async def process_recording_from_url(session_id: str, recording_url: str):
+    """Download recording from URL and process it for anomaly detection."""
+    try:
+        logger.info(f"Processing recording from URL for session {session_id}: {recording_url}")
+        
+        # Download the recording from the URL
+        import httpx
+        async with httpx.AsyncClient() as client:
+            response = await client.get(recording_url)
+            if response.status_code != 200:
+                raise Exception(f"Failed to download recording: HTTP {response.status_code}")
+            
+            recording_data = response.content
+            logger.info(f"Downloaded recording: {len(recording_data)} bytes")
+        
+        # Save the recording using session manager (this will trigger video processing)
+        filename = f"session_recording_{session_id}.webm"
+        recording_info = session_manager.save_recording(session_id, recording_data, filename)
+        
+        logger.info(f"Recording processed and saved: {recording_info.file_path}")
+        return recording_info
+        
+    except Exception as e:
+        logger.error(f"Failed to process recording from URL for session {session_id}: {e}")
+        raise
+
+async def process_recording_from_url_background(session_id: str, recording_url: str):
+    """Background task to download and process recording without blocking session completion."""
+    try:
+        logger.info(f"Starting background processing of recording for session {session_id}")
+        await process_recording_from_url(session_id, recording_url)
+        logger.info(f"Background recording processing completed for session {session_id}")
+    except Exception as e:
+        logger.error(f"Background recording processing failed for session {session_id}: {e}")
+        # Don't raise - this is a background task
+
+async def start_post_processing_background(session_id: str):
+    """Background task to run evaluation and PDF generation without blocking session completion."""
+    try:
+        logger.info(f"Starting background post-processing for session {session_id}")
+        
+        # Run in thread pool since these are CPU-bound operations
+        loop = asyncio.get_event_loop()
+        
+        def run_post_processing():
+            try:
+                # Run evaluation
+                if EVALUATION_MODULE_AVAILABLE:
+                    eval_script = InterviewEvaluationModuleGemini()
+                    result = eval_script.evaluate_interview_session(session_id)
+                    logger.info(f"Background evaluation result for {session_id}: {result}")
+                else:
+                    logger.warning("Evaluation module not available, skipping evaluation")
+                
+                # Run PDF generation
+                if PDF_GENERATION_AVAILABLE:
+                    generate_and_upload_report(session_id)
+                    logger.info(f"Background PDF generation completed for {session_id}")
+                else:
+                    logger.warning("PDF generation module not available, skipping PDF generation")
+                    
+            except Exception as e:
+                logger.error(f"Background post-processing error for {session_id}: {e}")
+        
+        # Run in executor to avoid blocking
+        await loop.run_in_executor(None, run_post_processing)
+        logger.info(f"Background post-processing completed for session {session_id}")
+        
+    except Exception as e:
+        logger.error(f"Background post-processing failed for session {session_id}: {e}")
+        # Don't raise - this is a background task
 
 class VADProcessor:
     def __init__(self):
@@ -2118,8 +2198,12 @@ async def upload_recording(
                 if session_data.get("status") != "completed":
                     logger.info(f"Fallback: Completing session {session_id} during recording upload (WebSocket may have disconnected)")
                     
-                    # Save session with immediate post-processing (evaluation and PDF generation)
-                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
+                    # Save session without blocking post-processing
+                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                    
+                    # Start post-processing in background
+                    import asyncio
+                    asyncio.create_task(start_post_processing_background(session_id))
                     session_data["status"] = "completed"
                     
                     logger.info(f"Fallback: Session {session_id} completed successfully during recording upload with immediate post-processing")
@@ -2756,7 +2840,7 @@ async def end_session(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/sessions/{session_id}/complete")
-async def complete_session(session_id: str):
+async def complete_session(session_id: str, completion_data: Optional[SessionCompletionRequest] = None):
     """Complete a session by saving all information to database without deleting from memory."""
     try:
         logger.info(f"Session completion requested for session {session_id}")
@@ -2771,8 +2855,21 @@ async def complete_session(session_id: str):
         session_data = session_manager.sessions[session_id]
         logger.info(f"Saving session {session_id} to database with conversation history length: {len(session_data.get('conversation_history', []))}")
         
-        # Save session with immediate post-processing
-        session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
+        # If recording URL is provided, store it in session data for processing
+        if completion_data and completion_data.recording_url:
+            logger.info(f"Recording URL provided for session {session_id}: {completion_data.recording_url}")
+            session_data["recording_url_from_frontend"] = completion_data.recording_url
+            
+            # Trigger background download and processing of the recording (don't wait)
+            import asyncio
+            asyncio.create_task(process_recording_from_url_background(session_id, completion_data.recording_url))
+        
+        # Save session without immediate post-processing (do it in background)
+        session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+        
+        # Start post-processing in background
+        import asyncio
+        asyncio.create_task(start_post_processing_background(session_id))
         logger.info(f"Session {session_id} saved to database successfully")
         
         # Update session status to completed
@@ -2782,7 +2879,8 @@ async def complete_session(session_id: str):
         return {
             "status": "completed",
             "session_id": session_id,
-            "message": "Session completed and information saved to database"
+            "message": "Session completed and information saved to database",
+            "recording_processed": completion_data.recording_url is not None if completion_data else False
         }
         
     except HTTPException:
@@ -3095,8 +3193,12 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                                 # Update session status to completed
                                 session_data["status"] = "completed"
                                 
-                                # Save session information with immediate post-processing
-                                session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
+                                # Save session information without blocking post-processing
+                                session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
+                                
+                                # Start post-processing in background
+                                import asyncio
+                                asyncio.create_task(start_post_processing_background(session_id))
                                 
                                 logger.info(f"Session {session_id} auto-saved successfully with immediate post-processing")
                             else:
@@ -3129,10 +3231,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     # Update session status to completed
                     session_data["status"] = "completed"
                     
-                    # Save session information with immediate post-processing
-                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
+                    # Save session information without blocking post-processing
+                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
                     
-                    logger.info(f"Session {session_id} auto-saved successfully with immediate post-processing")
+                    # Start post-processing in background
+                    import asyncio
+                    asyncio.create_task(start_post_processing_background(session_id))
+                    
+                    logger.info(f"Session {session_id} auto-saved successfully with background post-processing")
                 else:
                     logger.info(f"Session {session_id} already completed, skipping auto-save")
             else:
@@ -3159,10 +3265,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     # Update session status to completed
                     session_data["status"] = "completed"
                     
-                    # Save session information with immediate post-processing
-                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=False)
+                    # Save session information without blocking post-processing
+                    session_manager.save_session_to_database(session_id, session_data, skip_post_processing=True)
                     
-                    logger.info(f"Session {session_id} auto-saved successfully after error with immediate post-processing")
+                    # Start post-processing in background
+                    import asyncio
+                    asyncio.create_task(start_post_processing_background(session_id))
+                    
+                    logger.info(f"Session {session_id} auto-saved successfully after error with background post-processing")
                 else:
                     logger.info(f"Session {session_id} already completed, skipping auto-save after error")
             else:
