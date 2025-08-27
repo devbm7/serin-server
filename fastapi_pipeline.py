@@ -956,13 +956,13 @@ class SessionManager:
             "created_at": datetime.now(),
             "model_request": model_request,
             "conversation_history": [],
-            "audio_queue": queue.Queue(maxsize=1000),  # Audio buffer queue
+            "audio_queue": queue.Queue(maxsize=20000),  # Audio buffer queue
             "current_utterance": [],  # Current utterance buffer
             "silence_chunks": 0,  # Silence counter
             "is_processing": False,  # Processing flag
             "processing_thread": None,  # Background processing thread
             "chunks_per_second": 16000 / 512,  # Calculate chunks per second (31.25 chunks/sec for 32ms chunks)
-            "silent_chunks_threshold": int(3 * (16000 / 512)),  # 3 seconds of silence (~95.6 chunks)
+            "silent_chunks_threshold": int(2 * (16000 / 512)),  # 2 seconds of silence (~63.7 chunks)
         }
         
         # Store session immediately so it's available for retrieval
@@ -1073,7 +1073,7 @@ class SessionManager:
             "model_request": model_request,
             "device_preferences": init_request.device_preferences.dict() if init_request.device_preferences else None,
             "conversation_history": [],
-            "audio_queue": queue.Queue(maxsize=1000),  # Audio buffer queue
+            "audio_queue": queue.Queue(maxsize=10000),  # Audio buffer queue
             "current_utterance": [],  # Current utterance buffer
             "silence_chunks": 0,  # Silence counter
             "is_processing": False,  # Processing flag
