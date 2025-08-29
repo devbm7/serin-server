@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     portaudio19-dev \
     curl \
     ffmpeg \
+    gunicorn \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the requirements file into the container at /app
