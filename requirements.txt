@@ -9,6 +9,7 @@ uvicorn[standard]
 pydantic
 python-multipart
 websockets
+redis
 
 # Audio processing
 soundfile

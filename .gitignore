@@ -1,3 +1,6 @@
 rf-detr-nano.pth
 fastapi_server.log
 fastapi_server.log
+recordings
+sessions
+__pycache__

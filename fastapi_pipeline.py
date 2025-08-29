@@ -22,6 +22,20 @@ import requests
 import subprocess
  
 import PyPDF2
+# Redis session snapshot helper
+try:
+    from redis_client import (
+        get_redis,
+        save_session_snapshot as redis_save_session_snapshot,
+        delete_session as redis_delete_session,
+        touch_session as redis_touch_session,
+        load_session_snapshot as redis_load_session_snapshot,
+    )
+    REDIS_AVAILABLE = True
+    logging.info("Redis connection established")
+except ImportError:
+    REDIS_AVAILABLE = False
+    get_redis = None  # type: ignore
 
 # Video processing imports
 try:
@@ -837,10 +851,23 @@ class SessionManager:
         else:
             logger.warning("Supabase storage is not available, using local storage only")
         
-        # Session timeout settings (30 minutes)
-        self.session_timeout_seconds = 30 * 60  # 30 minutes
+        # Session timeout settings (20 minutes)
+        self.session_timeout_seconds = 20 * 60  # 20 minutes
         self.last_activity: Dict[str, datetime] = {}
         
+        # Optional Redis session store
+        self.redis = None
+        if 'REDIS_AVAILABLE' in globals() and REDIS_AVAILABLE and get_redis:
+            try:
+                self.redis = get_redis()
+                if self.redis:
+                    logger.info("Connected to Redis: session info will be mirrored with TTL")
+                else:
+                    logger.warning("Redis not available; continuing with in-memory session info only")
+            except Exception as e:
+                logger.warning(f"Redis initialization failed: {e}")
+                self.redis = None
+
         # Start session cleanup thread
         self.cleanup_thread = threading.Thread(target=self._session_cleanup_worker, daemon=True)
         self.cleanup_thread.start()
@@ -944,6 +971,11 @@ class SessionManager:
     def update_session_activity(self, session_id: str):
         """Update the last activity time for a session."""
         self.last_activity[session_id] = datetime.now()
+        if getattr(self, "redis", None):
+            try:
+                redis_touch_session(self.redis, session_id, ttl=self.session_timeout_seconds)
+            except Exception as e:
+                logger.debug(f"Redis touch failed for {session_id}: {e}")
     
     def create_session(self, session_id: str, model_request: ModelSelectionRequest) -> Dict:
         """Create a new interview session with all necessary components."""
@@ -969,6 +1001,38 @@ class SessionManager:
         self.sessions[session_id] = session_data
         self.update_session_activity(session_id)
         logger.info(f"Session {session_id} stored in memory, starting initialization...")
+        # Save initial snapshot to Redis
+        if getattr(self, "redis", None):
+            try:
+                snapshot = {
+                    "id": session_id,
+                    "status": session_data["status"],
+                    "created_at": session_data["created_at"].isoformat(),
+                    "job_role": model_request.job_role,
+                    "user_id": model_request.user_id,
+                    "resume_url": model_request.resume_url,
+                    "conversation_history": session_data.get("conversation_history", []),
+                    "recording_url": None,
+                }
+                redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
+            except Exception as e:
+                logger.debug(f"Redis snapshot failed for {session_id}: {e}")
+        # Save initial snapshot to Redis (minimal, serializable)
+        if getattr(self, "redis", None):
+            try:
+                snapshot = {
+                    "id": session_id,
+                    "status": session_data["status"],
+                    "created_at": session_data["created_at"].isoformat(),
+                    "job_role": model_request.job_role,
+                    "user_id": model_request.user_id,
+                    "resume_url": model_request.resume_url,
+                    "conversation_history": session_data.get("conversation_history", []),
+                    "recording_url": None,
+                }
+                redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
+            except Exception as e:
+                logger.debug(f"Redis snapshot failed for {session_id}: {e}")
         
         # Initialize processors
         try:
@@ -1033,6 +1097,21 @@ class SessionManager:
             # Update session status to active after successful initialization
             session_data["status"] = "active"
             logger.info(f"Session {session_id} initialized successfully")
+            if getattr(self, "redis", None):
+                try:
+                    snapshot = {
+                        "id": session_id,
+                        "status": session_data["status"],
+                        "created_at": session_data["created_at"].isoformat(),
+                        "job_role": model_request.job_role,
+                        "user_id": model_request.user_id,
+                        "resume_url": model_request.resume_url,
+                        "conversation_history": session_data.get("conversation_history", []),
+                        "recording_url": None,
+                    }
+                    redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
+                except Exception as e:
+                    logger.debug(f"Redis snapshot update failed for {session_id}: {e}")
             return session_data
             
         except Exception as e:
@@ -1149,6 +1228,21 @@ class SessionManager:
             # Update session status to active after successful initialization
             session_data["status"] = "active"
             logger.info(f"Session {session_id} initialized successfully")
+            if getattr(self, "redis", None):
+                try:
+                    snapshot = {
+                        "id": session_id,
+                        "status": session_data["status"],
+                        "created_at": session_data["created_at"].isoformat(),
+                        "job_role": model_request.job_role,
+                        "user_id": model_request.user_id,
+                        "resume_url": model_request.resume_url,
+                        "conversation_history": session_data.get("conversation_history", []),
+                        "recording_url": None,
+                    }
+                    redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
+                except Exception as e:
+                    logger.debug(f"Redis snapshot update failed for {session_id}: {e}")
             return session_data
             
         except Exception as e:
@@ -1193,6 +1287,12 @@ class SessionManager:
             if session_id in self.last_activity:
                 del self.last_activity[session_id]
             logger.info(f"Session {session_id} deleted")
+        # Always try Redis cleanup
+        if getattr(self, "redis", None):
+            try:
+                redis_delete_session(self.redis, session_id)
+            except Exception as e:
+                logger.debug(f"Redis delete failed for {session_id}: {e}")
 
     def save_session_to_database(self, session_id: str, session_data: dict, skip_post_processing: bool = False):
         """Update existing session information in the interview_sessions table."""
@@ -1335,6 +1435,22 @@ class SessionManager:
                     logger.info(f"Starting immediate post-processing jobs for session {session_id}")
                     self.start_post_session_jobs(session_id)
                     logger.info(f"Post-processing jobs completed for session {session_id}")
+                # Update Redis snapshot with completion state
+                if getattr(self, "redis", None):
+                    try:
+                        snapshot = {
+                            "id": session_id,
+                            "status": "completed",
+                            "created_at": session_data.get("created_at").isoformat() if session_data.get("created_at") else None,
+                            "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
+                            "user_id": session_data.get("model_request").user_id if session_data.get("model_request") else None,
+                            "resume_url": session_data.get("model_request").resume_url if session_data.get("model_request") else None,
+                            "conversation_history": conversation_history,
+                            "recording_url": recording_url,
+                        }
+                        redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
+                    except Exception as e:
+                        logger.debug(f"Redis final snapshot failed for {session_id}: {e}")
             else:
                 logger.error(f"Failed to update session {session_id} information in database")
                 
@@ -1472,6 +1588,14 @@ Based on the resume, ask one insightful question related to the topic to start t
                     
                     # Store recording info
                     self.recordings[session_id] = recording_info
+                    # Update Redis with recording URL if available
+                    if getattr(self, "redis", None):
+                        try:
+                            snap = redis_load_session_snapshot(self.redis, session_id) or {}
+                            snap["recording_url"] = upload_result["public_url"]
+                            redis_save_session_snapshot(self.redis, session_id, snap, ttl=self.session_timeout_seconds)
+                        except Exception as e:
+                            logger.debug(f"Redis recording URL update failed for {session_id}: {e}")
                     
                     logger.info(f"Raw recording uploaded to Supabase for session {session_id}: {upload_result['file_path']} ({upload_result['file_size']} bytes)")
                     return recording_info
