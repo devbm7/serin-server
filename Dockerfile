@@ -38,4 +38,4 @@ EXPOSE 8000
 
 # Run start_fastapi_server.py when the container launches
 # CMD ["python", "start_fastapi_server.py"]
-CMD ["gunicorn", "-w 4", "-b 0.0.0.0:8000", "fastapi_pipeline:app"]
+CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "fastapi_pipeline:app"]
