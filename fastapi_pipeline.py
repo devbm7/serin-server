@@ -24,7 +24,7 @@ import subprocess
 import PyPDF2
 # Redis session snapshot helper
 try:
-    from redis_client import (
+    from redisc import (
         get_redis,
         save_session_snapshot as redis_save_session_snapshot,
         delete_session as redis_delete_session,
