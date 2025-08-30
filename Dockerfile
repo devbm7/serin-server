@@ -29,6 +29,7 @@ COPY start_fastapi_server.py .
 COPY pipeline_config.yaml .
 COPY evalm.py .
 COPY pdf5.py .
+COPY redisc.py .
 
 # Copy local model directories if they exist (only for ASR)
 # COPY whisper-medium/ ./whisper-medium
