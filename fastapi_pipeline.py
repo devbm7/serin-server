@@ -193,11 +193,20 @@ async def health_check():
     
     all_models_ready = all(models_ready.values())
     
+    # Check session management status
+    session_mgmt_status = {
+        "redis_connected": session_manager.redis is not None,
+        "active_sessions": len(session_manager.sessions),
+        "worker_id": os.getpid(),
+        "session_timeout_seconds": session_manager.session_timeout_seconds
+    }
+    
     return {
         "status": "healthy" if all_models_ready else "initializing",
         "timestamp": datetime.now().isoformat(),
         "models_ready": models_ready,
         "all_models_ready": all_models_ready,
+        "session_management": session_mgmt_status,
         "websocket_support": True,
         "endpoints": {
             "health": "/health",
@@ -817,7 +826,8 @@ class VideoAnnotationProcessor:
 # Global session manager
 class SessionManager:
     def __init__(self):
-        self.sessions: Dict[str, Dict] = {}
+        # Redis will be the primary session store
+        self.sessions: Dict[str, Dict] = {}  # Keep as cache for active sessions
         self.session_counters: Dict[str, int] = {}
         # Add recordings storage
         self.recordings: Dict[str, RecordingInfo] = {}
@@ -855,23 +865,149 @@ class SessionManager:
         self.session_timeout_seconds = 20 * 60  # 20 minutes
         self.last_activity: Dict[str, datetime] = {}
         
-        # Optional Redis session store
+        # Redis session store - now primary storage
         self.redis = None
         if 'REDIS_AVAILABLE' in globals() and REDIS_AVAILABLE and get_redis:
             try:
                 self.redis = get_redis()
                 if self.redis:
-                    logger.info("Connected to Redis: session info will be mirrored with TTL")
+                    logger.info("Connected to Redis: using as primary session store")
                 else:
-                    logger.warning("Redis not available; continuing with in-memory session info only")
+                    logger.warning("Redis not available; falling back to in-memory session storage")
             except Exception as e:
                 logger.warning(f"Redis initialization failed: {e}")
                 self.redis = None
+        else:
+            logger.warning("Redis not available; falling back to in-memory session storage")
 
         # Start session cleanup thread
         self.cleanup_thread = threading.Thread(target=self._session_cleanup_worker, daemon=True)
         self.cleanup_thread.start()
         logger.info("Session cleanup thread started")
+
+    def _serialize_session(self, session_data: Dict) -> str:
+        """Serialize session data for Redis storage, excluding non-serializable objects."""
+        serializable_session = {
+            "id": session_data.get("id"),
+            "status": session_data.get("status"),
+            "created_at": session_data.get("created_at").isoformat() if session_data.get("created_at") else None,
+            "model_request": session_data.get("model_request").dict() if hasattr(session_data.get("model_request"), 'dict') else session_data.get("model_request"),
+            "conversation_history": session_data.get("conversation_history", []),
+            "current_utterance": session_data.get("current_utterance", []),
+            "silence_chunks": session_data.get("silence_chunks", 0),
+            "is_processing": session_data.get("is_processing", False),
+            "chunks_per_second": session_data.get("chunks_per_second"),
+            "silent_chunks_threshold": session_data.get("silent_chunks_threshold"),
+            "resume_content": session_data.get("resume_content"),
+            "last_response": session_data.get("last_response").dict() if hasattr(session_data.get("last_response"), 'dict') else session_data.get("last_response"),
+            "video_frames": session_data.get("video_frames", []),
+            "worker_id": os.getpid(),  # Track which worker created/accessed the session
+        }
+        return json.dumps(serializable_session, default=str)
+
+    def _deserialize_session(self, session_json: str) -> Dict:
+        """Deserialize session data from Redis storage."""
+        try:
+            session_data = json.loads(session_json)
+            # Convert ISO string back to datetime
+            if session_data.get("created_at"):
+                session_data["created_at"] = datetime.fromisoformat(session_data["created_at"])
+            return session_data
+        except Exception as e:
+            logger.error(f"Failed to deserialize session data: {e}")
+            return {}
+
+    def _save_session_to_redis(self, session_id: str, session_data: Dict) -> bool:
+        """Save session data to Redis."""
+        if not self.redis:
+            return False
+        
+        try:
+            serialized_data = self._serialize_session(session_data)
+            self.redis.set(f"session_data:{session_id}", serialized_data, ex=self.session_timeout_seconds)
+            logger.debug(f"Session {session_id} saved to Redis")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save session {session_id} to Redis: {e}")
+            return False
+
+    def _load_session_from_redis(self, session_id: str) -> Optional[Dict]:
+        """Load session data from Redis."""
+        if not self.redis:
+            return None
+        
+        try:
+            session_json = self.redis.get(f"session_data:{session_id}")
+            if session_json:
+                session_data = self._deserialize_session(session_json)
+                logger.debug(f"Session {session_id} loaded from Redis")
+                return session_data
+            return None
+        except Exception as e:
+            logger.error(f"Failed to load session {session_id} from Redis: {e}")
+            return None
+
+    def _delete_session_from_redis(self, session_id: str) -> bool:
+        """Delete session data from Redis."""
+        if not self.redis:
+            return False
+        
+        try:
+            self.redis.delete(f"session_data:{session_id}")
+            logger.debug(f"Session {session_id} deleted from Redis")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete session {session_id} from Redis: {e}")
+            return False
+
+    def _reconstruct_session_objects(self, session_id: str, session_data: Dict) -> Dict:
+        """Reconstruct session objects that can't be serialized (like queues and processors)."""
+        try:
+            # Reconstruct audio queue
+            session_data["audio_queue"] = queue.Queue(maxsize=20000)
+            
+            # Reconstruct processors (these will be lazy-loaded when needed)
+            session_data["asr_processor"] = None
+            session_data["vad_processor"] = None
+            session_data["llm_client"] = None
+            session_data["tts_processor"] = None
+            
+            # Reconstruct processing thread
+            session_data["processing_thread"] = None
+            
+            logger.debug(f"Session {session_id} objects reconstructed")
+            return session_data
+        except Exception as e:
+            logger.error(f"Failed to reconstruct session objects for {session_id}: {e}")
+            return session_data
+
+    def _ensure_processors_loaded(self, session_id: str, session_data: Dict) -> Dict:
+        """Ensure all processors are loaded for a session (lazy loading)."""
+        try:
+            # Lazy load ASR processor if needed
+            if not session_data.get("asr_processor"):
+                logger.debug(f"Lazy loading ASR processor for session {session_id}")
+                session_data["asr_processor"] = ASRProcessor()
+            
+            # Lazy load VAD processor if needed
+            if not session_data.get("vad_processor"):
+                logger.debug(f"Lazy loading VAD processor for session {session_id}")
+                session_data["vad_processor"] = VADProcessor()
+            
+            # Lazy load LLM client if needed
+            if not session_data.get("llm_client"):
+                logger.debug(f"Lazy loading LLM client for session {session_id}")
+                session_data["llm_client"] = LiteLLMClient()
+            
+            # Lazy load TTS processor if needed
+            if not session_data.get("tts_processor"):
+                logger.debug(f"Lazy loading TTS processor for session {session_id}")
+                session_data["tts_processor"] = TTSProcessor()
+            
+            return session_data
+        except Exception as e:
+            logger.error(f"Failed to load processors for session {session_id}: {e}")
+            return session_data
 
     def _run_script_background(self, script_path: Path, session_id: str, job_name: str):
         """Run a Python script in background with --session-id, capturing logs."""
@@ -976,6 +1112,18 @@ class SessionManager:
                 redis_touch_session(self.redis, session_id, ttl=self.session_timeout_seconds)
             except Exception as e:
                 logger.debug(f"Redis touch failed for {session_id}: {e}")
+
+    def update_session_data(self, session_id: str, session_data: Dict):
+        """Update session data in both local cache and Redis."""
+        # Update local cache
+        if session_id in self.sessions:
+            self.sessions[session_id].update(session_data)
+        
+        # Save to Redis for cross-worker access
+        if self.redis and session_id in self.sessions:
+            self._save_session_to_redis(session_id, self.sessions[session_id])
+        
+        logger.debug(f"Session {session_id} data updated")
     
     def create_session(self, session_id: str, model_request: ModelSelectionRequest) -> Dict:
         """Create a new interview session with all necessary components."""
@@ -1001,38 +1149,9 @@ class SessionManager:
         self.sessions[session_id] = session_data
         self.update_session_activity(session_id)
         logger.info(f"Session {session_id} stored in memory, starting initialization...")
-        # Save initial snapshot to Redis
-        if getattr(self, "redis", None):
-            try:
-                snapshot = {
-                    "id": session_id,
-                    "status": session_data["status"],
-                    "created_at": session_data["created_at"].isoformat(),
-                    "job_role": model_request.job_role,
-                    "user_id": model_request.user_id,
-                    "resume_url": model_request.resume_url,
-                    "conversation_history": session_data.get("conversation_history", []),
-                    "recording_url": None,
-                }
-                redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
-            except Exception as e:
-                logger.debug(f"Redis snapshot failed for {session_id}: {e}")
-        # Save initial snapshot to Redis (minimal, serializable)
-        if getattr(self, "redis", None):
-            try:
-                snapshot = {
-                    "id": session_id,
-                    "status": session_data["status"],
-                    "created_at": session_data["created_at"].isoformat(),
-                    "job_role": model_request.job_role,
-                    "user_id": model_request.user_id,
-                    "resume_url": model_request.resume_url,
-                    "conversation_history": session_data.get("conversation_history", []),
-                    "recording_url": None,
-                }
-                redis_save_session_snapshot(self.redis, session_id, snapshot, ttl=self.session_timeout_seconds)
-            except Exception as e:
-                logger.debug(f"Redis snapshot failed for {session_id}: {e}")
+        
+        # Save full session data to Redis for cross-worker access
+        self._save_session_to_redis(session_id, session_data)
         
         # Initialize processors
         try:
@@ -1255,10 +1374,28 @@ class SessionManager:
             raise HTTPException(status_code=500, detail=f"Failed to initialize session: {str(e)}")
     
     def get_session(self, session_id: str) -> Dict:
-        """Get session data."""
-        if session_id not in self.sessions:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return self.sessions[session_id]
+        """Get session data from local cache or Redis."""
+        # First check local cache
+        if session_id in self.sessions:
+            logger.debug(f"Session {session_id} found in local cache")
+            return self.sessions[session_id]
+        
+        # If not in local cache, try to load from Redis
+        if self.redis:
+            session_data = self._load_session_from_redis(session_id)
+            if session_data:
+                # Reconstruct session with necessary objects
+                session_data = self._reconstruct_session_objects(session_id, session_data)
+                # Ensure processors are loaded (lazy loading)
+                session_data = self._ensure_processors_loaded(session_id, session_data)
+                # Cache in local memory
+                self.sessions[session_id] = session_data
+                self.last_activity[session_id] = datetime.now()
+                logger.info(f"Session {session_id} loaded from Redis and cached locally")
+                return session_data
+        
+        # Session not found anywhere
+        raise HTTPException(status_code=404, detail="Session not found")
     
     def delete_session(self, session_id: str):
         """Delete a session and clean up resources."""
@@ -1291,6 +1428,7 @@ class SessionManager:
         if getattr(self, "redis", None):
             try:
                 redis_delete_session(self.redis, session_id)
+                self._delete_session_from_redis(session_id)
             except Exception as e:
                 logger.debug(f"Redis delete failed for {session_id}: {e}")
 
