@@ -413,6 +413,8 @@ class SessionInitializationRequest(BaseModel):
     job_role: str  # From job template
     user_id: str   # User ID for resume
     resume_url: str  # Direct path to resume in Supabase storage
+    job_description: Optional[str] = None
+    topic_weightage: Optional[Dict[str, float]] = None
     llm_provider: str = "gemini"
     llm_model: str = "gemini-2.5-flash"
     asr_model: str = "gemini-2.5-pro"
@@ -992,7 +994,8 @@ class SessionManager:
             logger.info(f"Creating initial prompt for session {session_id}")
             initial_prompt = self.create_initial_prompt(
                 model_request.job_role,
-                session_data["resume_content"]
+                session_data["resume_content"],
+                session_data.get("job_description")
             )
             session_data["conversation_history"] = [{"role": "system", "content": initial_prompt}, {"role": "user", "content": "Hello"}]
             # session_data["conversation_history"].append({"role": "user", "content": "Hello"})
@@ -1004,7 +1007,9 @@ class SessionManager:
                     session_data["llm_client"],
                     session_data["conversation_history"],
                     model_request.job_role,
-                    session_data["resume_content"]
+                    session_data["resume_content"],
+                    session_data.get("job_description"),
+                    session_data.get("topic_weightage")
                 )
                 if opening_question:
                     # Get conversational response (natural phrasing)
@@ -1072,6 +1077,8 @@ class SessionManager:
             "created_at": datetime.now(),
             "model_request": model_request,
             "device_preferences": init_request.device_preferences.dict() if init_request.device_preferences else None,
+            "job_description": init_request.job_description,
+            "topic_weightage": init_request.topic_weightage,
             "conversation_history": [],
             "audio_queue": queue.Queue(maxsize=10000),  # Audio buffer queue
             "current_utterance": [],  # Current utterance buffer
@@ -1294,6 +1301,8 @@ class SessionManager:
             # Prepare session information JSON (without resume_url and recording_url)
             session_information = {
                 "job_role": session_data.get("model_request").job_role if session_data.get("model_request") else None,
+                "job_description": session_data.get("job_description"),
+                "topic_weightage": session_data.get("topic_weightage"),
                 "conversation_history": conversation_history,
                 "anomalies_detected": anomalies_detected,
                 "asr_model": asr_model_used,  # Dynamic based on what was actually used
@@ -1351,18 +1360,19 @@ class SessionManager:
             logger.error(f"Failed to load resume: {e}")
             return "Resume content not available"
     
-    def create_initial_prompt(self, interview_topic: str, resume_content: str) -> str:
+    def create_initial_prompt(self, interview_topic: str, resume_content: str, job_description: Optional[str] = None) -> str:
         """Create the initial system prompt for the interview."""
+        description_block = f"\nHere is the job description for context:\n--- START JOB DESCRIPTION ---\n{job_description}\n--- END JOB DESCRIPTION ---\n" if job_description else ""
         return f"""You are Serin, an interviewer. Your goal is to understand the user's background and skills. Based on what the user says, ask a relevant follow-up question to gather more details. For example, if the user says 'I made a machine learning model,' you should ask something like, 'Great! Which type of machine learning model did you make?' Do not ask more than one question. The one question should be a followup to what the user said. Do not assume anything else that what is given to you. If you do not understand the user's response, ask for clarification. Do not ask for clarification if you understand the user's response. If you think that resume does not have adequate information for the given topic, you can ask a general question around the topic. Do not mention about reading the resume in the conversation. First, introduce yourself as Serin. Then, ask the question.
 
 Here is the candidate's resume:
 --- START RESUME ---
 {resume_content}
 --- END RESUME ---
-
+{description_block}
 The topic for today's interview is: {interview_topic}
 
-Based on the resume, ask one insightful question related to the topic to start the conversation."""
+Based on the resume{', the job description' if job_description else ''}, ask one insightful question related to the topic to start the conversation."""
     
     def get_transcription_confidence(self, transcription: str, audio_quality: float) -> float:
         """Calculate transcription confidence based on multiple factors."""
@@ -2042,7 +2052,9 @@ def process_utterance(session_id: str, audio_data: np.ndarray) -> InterviewRespo
             session["llm_client"], 
             session["conversation_history"], 
             session["model_request"].job_role,
-            session["resume_content"]
+            session["resume_content"],
+            session.get("job_description"),
+            session.get("topic_weightage")
         )
         
         if next_question:
@@ -2071,10 +2083,20 @@ def process_utterance(session_id: str, audio_data: np.ndarray) -> InterviewRespo
         logger.error(f"Error processing utterance for session {session_id}: {e}")
         return InterviewResponse(transcription="", response="", audio_response=None)
 
-def generate_next_question(llm_client, conversation_history, interview_topic, resume_content):
+def generate_next_question(llm_client, conversation_history, interview_topic, resume_content, job_description: Optional[str] = None, topic_weightage: Optional[Dict[str, float]] = None):
     """Generate the next interview question."""
     logger.info("Generating next question")
-    qgen_prompt = f"""You are a question generation module. Your task is to generate the next interview question based on the conversation history, the interview topic, and the candidate's resume. The question should be a logical follow-up to the previous turn in the conversation. Do not ask more than one question. Do not ask for clarification. Just generate the question.
+    weights_block = ""
+    if topic_weightage:
+        try:
+            jd = float(topic_weightage.get('job_description', 0))
+            cr = float(topic_weightage.get('candidate_resume', 0))
+            hr = float(topic_weightage.get('hr', 0))
+            weights_block = f"\nWeightage Guidance (sum to 100): Job Description={jd}%, Candidate Resume={cr}%, HR={hr}%\nUse this to bias question focus proportionally (not strictly).\n"
+        except Exception:
+            pass
+    job_desc_block = f"\nHere is the job description for context:\n--- START JOB DESCRIPTION ---\n{job_description}\n--- END JOB DESCRIPTION ---\n" if job_description else ""
+    qgen_prompt = f"""You are a question generation module. Your task is to generate the next interview question based on the conversation history, the interview topic, the candidate's resume, and optionally the job description. The question should be a logical follow-up to the previous turn in the conversation. Do not ask more than one question. Do not ask for clarification. Just generate the question.
 
 Here is the candidate's resume:
 --- START RESUME ---
@@ -2082,6 +2104,7 @@ Here is the candidate's resume:
 --- END RESUME ---
 
 The topic for today's interview is: {interview_topic}
+{job_desc_block}{weights_block}
 
 Based on the conversation history, generate the next question."""
     messages = conversation_history + [{"role": "system", "content": qgen_prompt}]
