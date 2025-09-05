@@ -316,7 +316,7 @@ class InterviewEvaluationModuleGemini:
             
             # Fetch job template
             response = self.supabase_client.table("job_templates") \
-                .select("user_job_description") \
+                .select("description") \
                 .eq("template_id", template_id) \
                 .execute()
             
@@ -324,7 +324,7 @@ class InterviewEvaluationModuleGemini:
                 template_data = response.data[0]
                 
                 # Get job description from user_job_description field
-                job_description = template_data.get("user_job_description")
+                job_description = template_data.get("description")
                 
                 if job_description and isinstance(job_description, str) and job_description.strip():
                     logger.info(f"Successfully fetched job description for template: {template_id}")
